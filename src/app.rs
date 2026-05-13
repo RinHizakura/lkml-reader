@@ -25,6 +25,12 @@ pub enum View {
     Help,
 }
 
+enum PromptAction<R> {
+    Continue,
+    Cancel,
+    Accept(R),
+}
+
 pub struct App {
     list_name: String,
     filter: String,
@@ -137,6 +143,16 @@ impl App {
             return Ok(());
         }
         if !archive::repo_exists(&self.list_name, epoch) {
+            let label = format!("Clone {} epoch {}? [y/N]: ", self.list_name, epoch);
+            let confirmed = self
+                .handle_prompt(&label, |k, _| match k.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => PromptAction::Accept(()),
+                    _ => PromptAction::Cancel,
+                })?
+                .is_some();
+            if !confirmed {
+                return Err(anyhow::anyhow!("declined to clone epoch {}", epoch));
+            }
             let prev_view = std::mem::replace(
                 &mut self.view,
                 View::Loading(format!(
@@ -463,7 +479,10 @@ impl App {
         Ok(())
     }
 
-    fn handle_prompt(&self, label: &str) -> Result<Option<String>> {
+    fn handle_prompt<F, R>(&self, label: &str, mut handle: F) -> Result<Option<R>>
+    where
+        F: FnMut(KeyEvent, &mut String) -> PromptAction<R>,
+    {
         let (_, h) = size()?;
         let y = h.saturating_sub(1);
         let mut out = stdout();
@@ -476,16 +495,10 @@ impl App {
                 if k.kind != KeyEventKind::Press {
                     continue;
                 }
-                match k.code {
-                    KeyCode::Enter => return Ok(Some(input)),
-                    KeyCode::Esc => return Ok(None),
-                    KeyCode::Backspace => {
-                        input.pop();
-                    }
-                    KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
-                        input.push(c);
-                    }
-                    _ => {}
+                match handle(k, &mut input) {
+                    PromptAction::Continue => {}
+                    PromptAction::Cancel => return Ok(None),
+                    PromptAction::Accept(r) => return Ok(Some(r)),
                 }
                 ui::redraw_prompt(&mut out, label, &input, y)?;
             }
@@ -519,10 +532,23 @@ impl App {
                     let _ = self.open_selected();
                 }
                 KeyCode::Char('/') => {
-                    if let Some(s) = self.handle_prompt(&format!(
+                    let label = format!(
                         "Filter (subject substring, empty=clear) [{}]: ",
                         self.filter
-                    ))? {
+                    );
+                    if let Some(s) = self.handle_prompt(&label, |k, input| match k.code {
+                        KeyCode::Enter => PromptAction::Accept(input.clone()),
+                        KeyCode::Esc => PromptAction::Cancel,
+                        KeyCode::Backspace => {
+                            input.pop();
+                            PromptAction::Continue
+                        }
+                        KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+                            input.push(c);
+                            PromptAction::Continue
+                        }
+                        _ => PromptAction::Continue,
+                    })? {
                         self.filter = s;
                         let _ = self.apply_filter(out);
                     }
