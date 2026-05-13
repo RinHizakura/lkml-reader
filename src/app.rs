@@ -178,22 +178,12 @@ impl App {
             );
             let _ = self.render(out);
             let mut matches: Vec<String> = Vec::new();
-            for (i, commit) in all_commits.iter().enumerate() {
+            for commit in &all_commits {
                 if let Ok(raw) = archive::show_mail(&repo, commit) {
                     let mail = archive::parse_mail_from_raw(&raw, epoch, commit.clone());
                     if mail.title.to_lowercase().contains(&needle) {
                         matches.push(commit.clone());
                     }
-                }
-                if (i + 1) % 200 == 0 {
-                    self.view = View::Loading(format!(
-                        "Filtering '{}' in epoch {}: scanned {}, matches {}…",
-                        self.filter,
-                        epoch,
-                        i + 1,
-                        matches.len()
-                    ));
-                    let _ = self.render(out);
                 }
             }
             self.view = prev_view;
