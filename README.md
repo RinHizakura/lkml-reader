@@ -30,17 +30,6 @@ cargo build --release
 ./target/release/lkml-reader --list lkml
 ```
 
-Older epochs are auto-cloned on demand: when you page past the end of the
-current epoch, the TUI shows a loading view and runs `git clone --mirror` for
-the next-older epoch, then continues paging. You can still pre-clone manually
-if you prefer:
-
-```sh
-DIR="$HOME/.cache/lkml-reader/archives/<list>"
-mkdir -p "$DIR"
-git clone --mirror https://lore.kernel.org/<list>/git/<epoch>.git "$DIR/<epoch>.git"
-```
-
 CLI:
 
 ```
