@@ -34,14 +34,11 @@ pub struct App {
     cur_epoch: u32,
     current_repo: Option<PathBuf>,
 
-    /// Lazy cache of commit hashes per epoch. Populated on first visit.
+    /// Lazy cache of commit hashes per epoch, filtered by `filter` when set.
+    /// Populated on first visit to each epoch.
     epoch_commits: HashMap<u32, Vec<String>>,
 
-    /// When Some, pagination operates on this precomputed filtered list.
-    filtered_stream: Option<Vec<(u32, String)>>,
-
     page_size: usize,
-    page_idx: usize,
     current_page: Page,
     selected: usize,
 
@@ -65,9 +62,7 @@ impl App {
             cur_epoch: 0,
             current_repo: None,
             epoch_commits: HashMap::new(),
-            filtered_stream: None,
             page_size: page_size_for_terminal(),
-            page_idx: 0,
             current_page: Page::default(),
             selected: 0,
             view: View::Loading("Starting…".to_string()),
@@ -128,22 +123,15 @@ impl App {
     /// Reload from scratch: clear caches, reset to page 0, load.
     pub fn refresh<W: Write>(&mut self, out: &mut W) -> Result<()> {
         self.epoch_commits.clear();
-        self.filtered_stream = None;
-        self.page_idx = 0;
         self.current_page = Page::default();
         self.selected = 0;
-        self.current_repo = None;
-
         self.current_repo = Some(archive::local_repo_path(&self.list_name, self.cur_epoch));
-
-        if !self.filter.trim().is_empty() {
-            self.run_filter_scan(out)?;
-        }
         self.load_page_at(0, out)?;
         Ok(())
     }
 
-    /// Load all commit hashes for `epoch` into the cache, auto-cloning if needed.
+    /// Load commit hashes for `epoch` into the cache, auto-cloning if needed.
+    /// When `filter` is set, keeps only commits whose subject matches.
     fn ensure_epoch_commits<W: Write>(&mut self, epoch: u32, out: &mut W) -> Result<()> {
         if self.epoch_commits.contains_key(&epoch) {
             return Ok(());
@@ -162,32 +150,42 @@ impl App {
             clone_result?;
         }
         let repo = archive::local_repo_path(&self.list_name, epoch);
-        let commits = archive::list_all_commits(&repo)?;
+        let all_commits = archive::list_all_commits(&repo)?;
+
+        let needle = self.filter.trim().to_lowercase();
+        let commits = if needle.is_empty() {
+            all_commits
+        } else {
+            let prev_view = std::mem::replace(
+                &mut self.view,
+                View::Loading(format!("Filtering '{}' in epoch {}…", self.filter, epoch)),
+            );
+            let _ = self.render(out);
+            let mut matches: Vec<String> = Vec::new();
+            for (i, commit) in all_commits.iter().enumerate() {
+                if let Ok(raw) = archive::show_mail(&repo, commit) {
+                    let mail = archive::parse_mail_from_raw(&raw, epoch, commit.clone());
+                    if mail.title.to_lowercase().contains(&needle) {
+                        matches.push(commit.clone());
+                    }
+                }
+                if (i + 1) % 200 == 0 {
+                    self.view = View::Loading(format!(
+                        "Filtering '{}' in epoch {}: scanned {}, matches {}…",
+                        self.filter,
+                        epoch,
+                        i + 1,
+                        matches.len()
+                    ));
+                    let _ = self.render(out);
+                }
+            }
+            self.view = prev_view;
+            matches
+        };
+
         self.epoch_commits.insert(epoch, commits);
         Ok(())
-    }
-
-    /// Length of the active stream, when knowable.
-    pub fn stream_total(&self) -> Option<usize> {
-        if let Some(filtered) = &self.filtered_stream {
-            return Some(filtered.len());
-        }
-        let mut total = 0usize;
-        for &epoch in &self.available_epochs {
-            match self.epoch_commits.get(&epoch) {
-                Some(v) => total += v.len(),
-                None => return None,
-            }
-        }
-        Some(total)
-    }
-
-    pub fn total_pages(&self) -> Option<usize> {
-        let total = self.stream_total()?;
-        if total == 0 {
-            return Some(0);
-        }
-        Some((total + self.page_size - 1) / self.page_size)
     }
 
     /// Walk epochs newest-first to collect `count` (epoch, commit) pairs
@@ -195,12 +193,11 @@ impl App {
     fn resolve_stream_window<W: Write>(
         &mut self,
         offset: usize,
-        count: usize,
         out: &mut W,
     ) -> Result<Vec<(u32, String)>> {
+        let mut need = self.page_size;
         let mut items: Vec<(u32, String)> = Vec::new();
         let mut to_skip = offset;
-        let mut need = count;
         let mut eidx = self.available_epochs.len() - 1;
         loop {
             if need == 0 {
@@ -239,17 +236,7 @@ impl App {
     /// Returns an empty `Page` when past the end of the stream.
     fn fetch_page<W: Write>(&mut self, page_idx: usize, out: &mut W) -> Result<Page> {
         let start = page_idx * self.page_size;
-        let stream_slice: Vec<(u32, String)> = match &self.filtered_stream {
-            Some(filtered) => {
-                if start >= filtered.len() {
-                    Vec::new()
-                } else {
-                    let end = (start + self.page_size).min(filtered.len());
-                    filtered[start..end].to_vec()
-                }
-            }
-            None => self.resolve_stream_window(start, self.page_size, out)?,
-        };
+        let stream_slice = self.resolve_stream_window(start, out)?;
         let mut mails: Vec<Mail> = Vec::with_capacity(stream_slice.len());
         for (epoch, commit) in stream_slice {
             let repo = archive::local_repo_path(&self.list_name, epoch);
@@ -257,112 +244,39 @@ impl App {
                 mails.push(archive::parse_mail_from_raw(&raw, epoch, commit));
             }
         }
-        Ok(Page::new(mails))
+        Ok(Page::new(mails, page_idx))
     }
 
-    /// Pin selection bounds and update header context from the current page.
-    fn snap_view_from_current_page(&mut self) {
-        if self.current_page.is_empty() {
-            self.selected = 0;
-        } else if self.selected >= self.current_page.len() {
-            self.selected = self.current_page.len() - 1;
-        }
-        if let Some(first_epoch) = self.current_page.mails.first().map(|m| m.epoch) {
-            if let Some(i) = self.available_epochs.iter().position(|&e| e == first_epoch) {
-                self.update_cur_epoch(i);
-                self.current_repo = Some(archive::local_repo_path(&self.list_name, first_epoch));
-            }
-        }
-    }
 
-    /// Fetch and display page `idx`.
+    /// Fetch and display page `idx`. No-op when the fetched page is empty
+    /// (end-of-stream); current page is left untouched.
     pub fn load_page_at<W: Write>(&mut self, idx: usize, out: &mut W) -> Result<()> {
-        self.page_idx = idx;
-        self.current_page = self.fetch_page(idx, out)?;
-        self.snap_view_from_current_page();
-        Ok(())
-    }
-
-    /// Step to the next page. Fetches eagerly; if the result is empty we
-    /// treat that as end-of-stream and leave the current page untouched.
-    pub fn next_page<W: Write>(&mut self, out: &mut W) -> Result<()> {
-        let next_idx = self.page_idx + 1;
-        let next_page = self.fetch_page(next_idx, out)?;
-        if next_page.is_empty() {
+        let page = self.fetch_page(idx, out)?;
+        if page.is_empty() {
             return Ok(());
         }
-        self.page_idx = next_idx;
-        self.current_page = next_page;
+        self.current_page = page;
         self.selected = 0;
-        self.snap_view_from_current_page();
         Ok(())
+    }
+
+    pub fn next_page<W: Write>(&mut self, out: &mut W) -> Result<()> {
+        self.selected = 0;
+        self.load_page_at(self.current_page.page_idx + 1, out)
     }
 
     /// Step to the previous page, clamping at index 0.
     pub fn prev_page<W: Write>(&mut self, out: &mut W) -> Result<()> {
-        if self.page_idx == 0 {
+        if self.current_page.page_idx == 0 {
             return Ok(());
         }
-        self.load_page_at(self.page_idx - 1, out)
-    }
-
-    /// Eagerly scan every locally-cloned epoch and collect commits whose
-    /// subject matches the current filter. Populates `filtered_stream`.
-    fn run_filter_scan<W: Write>(&mut self, out: &mut W) -> Result<()> {
-        let needle = self.filter.trim().to_lowercase();
-        if needle.is_empty() {
-            self.filtered_stream = None;
-            return Ok(());
-        }
-
-        let prev_view = std::mem::replace(&mut self.view, View::Loading(String::new()));
-
-        let mut matches: Vec<(u32, String)> = Vec::new();
-        let mut scanned: usize = 0;
-
-        for i in (0..self.available_epochs.len()).rev() {
-            let epoch = self.available_epochs[i];
-            if !archive::repo_exists(&self.list_name, epoch) {
-                continue;
-            }
-            let repo = archive::local_repo_path(&self.list_name, epoch);
-            let Ok(commits) = archive::list_all_commits(&repo) else {
-                continue;
-            };
-            for commit in &commits {
-                if let Ok(raw) = archive::show_mail(&repo, commit) {
-                    let mail = archive::parse_mail_from_raw(&raw, epoch, commit.clone());
-                    if mail.title.to_lowercase().contains(&needle) {
-                        matches.push((epoch, commit.clone()));
-                    }
-                }
-                scanned += 1;
-                if scanned % 200 == 0 {
-                    self.view = View::Loading(format!(
-                        "Filtering '{}': scanned {}, matches {}…",
-                        self.filter,
-                        scanned,
-                        matches.len()
-                    ));
-                    let _ = self.render(out);
-                }
-            }
-            self.epoch_commits.insert(epoch, commits);
-        }
-
-        self.view = prev_view;
-        self.filtered_stream = Some(matches);
-        self.selected = 0;
-        Ok(())
+        self.load_page_at(self.current_page.page_idx - 1, out)
     }
 
     pub fn apply_filter<W: Write>(&mut self, out: &mut W) -> Result<()> {
-        if self.filter.trim().is_empty() {
-            self.filtered_stream = None;
-            self.selected = 0;
-        } else {
-            self.run_filter_scan(out)?;
-        }
+        self.epoch_commits.clear();
+        self.current_page = Page::default();
+        self.selected = 0;
         self.load_page_at(0, out)?;
         Ok(())
     }
@@ -433,9 +347,8 @@ impl App {
             out,
             &ui::ListView {
                 header: self.header_info(&epoch_label, &page_label),
-                page_idx: self.page_idx,
+                page_idx: self.current_page.page_idx,
                 page_size: self.page_size,
-                stream_total: self.stream_total(),
                 mails: &self.current_page.mails,
                 selected: self.selected,
                 empty_message: &empty_message,
@@ -490,10 +403,7 @@ impl App {
     }
 
     fn page_label(&self) -> String {
-        match self.total_pages() {
-            Some(n) => format!("{}/{}", self.page_idx + 1, n.max(1)),
-            None => format!("{}+", self.page_idx + 1),
-        }
+        format!("{}", self.current_page.page_idx + 1)
     }
 
     pub fn run(&mut self) -> Result<()> {
@@ -539,7 +449,7 @@ impl App {
                         self.render(out)?;
                     }
                     Event::Resize(_, _) => {
-                        let prev_global = self.page_idx * self.page_size + self.selected;
+                        let prev_global = self.current_page.page_idx * self.page_size + self.selected;
                         self.page_size = page_size_for_terminal();
                         let new_idx = prev_global / self.page_size;
                         self.selected = prev_global % self.page_size;

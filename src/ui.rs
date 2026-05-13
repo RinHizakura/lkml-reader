@@ -29,7 +29,6 @@ pub struct ListView<'a> {
     pub header: HeaderInfo<'a>,
     pub page_idx: usize,
     pub page_size: usize,
-    pub stream_total: Option<usize>,
     pub mails: &'a [Mail],
     pub selected: usize,
     pub empty_message: &'a [String],
@@ -64,7 +63,7 @@ pub fn draw_list<W: Write>(out: &mut W, view: &ListView) -> Result<()> {
     draw_list_body(out, view, cols, bottom)?;
     draw_hotkeys(
         out,
-        "↑/↓ select  ←/→ page  Home/End first/last  Enter view  / filter  u update  ? help  q quit",
+        "↑/↓ select  ←/→ page  Enter view  / filter  u update  ? help  q quit",
         cols,
         rows,
     )?;
@@ -184,8 +183,7 @@ fn draw_list_body<W: Write>(
 
     let total = view.mails.len();
     let page_offset = view.page_idx * view.page_size;
-    let idx_w_basis = view.stream_total.unwrap_or(page_offset + total);
-    let idx_w = idx_w_basis.to_string().len().max(3);
+    let idx_w = (page_offset + total).to_string().len().max(3);
     let date_w = 16;
     let author_w = 24;
 
@@ -266,9 +264,8 @@ fn draw_help_body<W: Write>(out: &mut W, cols: u16, bottom: u16) -> Result<()> {
         "  ↓          move selection down (within page)",
         "  →          next page",
         "  ←          previous page",
-        "  Home / End first / last (within page)",
         "  Enter      open selected mail",
-        "  /          set subsystem filter (eager scan across cloned epochs)",
+        "  /          set subsystem filter (lazy per-epoch, auto-clones older epochs as you page)",
         "  u          update current mirror (git remote update on the latest epoch)",
         "",
         "  Detail view:",

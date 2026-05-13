@@ -24,11 +24,12 @@ impl Mail {
 #[derive(Clone, Default)]
 pub struct Page {
     pub mails: Vec<Mail>,
+    pub page_idx: usize,
 }
 
 impl Page {
-    pub fn new(mails: Vec<Mail>) -> Self {
-        Self { mails }
+    pub fn new(mails: Vec<Mail>, page_idx: usize) -> Self {
+        Self { mails, page_idx }
     }
 
     pub fn is_empty(&self) -> bool {

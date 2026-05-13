@@ -14,7 +14,7 @@ community.
 
 - Pick any mailing list on lore.kernel.org (`linux-pm`, `linux-mm`,
   `linux-kernel`, `damon`, …) via `--list`.
-- Filter by subsystem interactively with `f` (case-insensitive substring match
+- Filter by subsystem interactively with `/` (case-insensitive substring match
   against the subject, e.g. `sched` matches `[PATCH sched/core]`, `[sched]`,
   `[scheduler]`).
 - Read the raw mail in a scrollable detail pane.
@@ -44,9 +44,8 @@ Defaults: `--list lkml`.
 |--------|------------------------|---------------------------------|
 | List   | `↑` / `↓`              | Move selection within page      |
 | List   | `←` / `→`              | Previous / next page            |
-| List   | `Home`/`End`           | First / last (within page)      |
 | List   | `Enter`                | Open mail                       |
-| List   | `/`                    | Set subject filter (eager scan across cloned epochs) |
+| List   | `/`                    | Set subject filter (lazy per-epoch, auto-clones older epochs as you page) |
 | List   | `u`                    | Update current mirror (`git remote update`) |
 | List   | `?`                    | Help                            |
 | List   | `q`                    | Quit                            |
@@ -114,6 +113,6 @@ view while it runs), then paging continues into the freshly-cloned mirror.
 ### Reading a mail
 
 When you press `Enter`, the app already knows the commit hash and epoch for the
-selected row (each entry in the current `page_items` carries its epoch + commit).
+selected row (each `Mail` in the current `Page` carries its epoch + commit).
 Opening the mail is simply `git show <hash>:m` against that epoch's local mirror
 — no network round-trip.
