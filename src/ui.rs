@@ -265,7 +265,7 @@ fn draw_help_body<W: Write>(out: &mut W, cols: u16, bottom: u16) -> Result<()> {
         "  →          next page",
         "  ←          previous page",
         "  Enter      open selected mail",
-        "  /          set subsystem filter (lazy per-epoch, auto-clones older epochs as you page)",
+        "  /          set subject filter (scans in the background; pages open as matches arrive)",
         "  u          update current mirror (git remote update on the latest epoch)",
         "",
         "  Detail view:",

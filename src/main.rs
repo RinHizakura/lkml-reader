@@ -2,8 +2,10 @@
 
 mod app;
 mod archive;
+mod filter;
 mod mail;
 mod parse;
+mod source;
 mod ui;
 
 use anyhow::Result;

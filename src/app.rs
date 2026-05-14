@@ -8,14 +8,15 @@ use crossterm::{
         disable_raw_mode, enable_raw_mode, size, EnterAlternateScreen, LeaveAlternateScreen,
     },
 };
-use std::collections::HashMap;
 use std::io::{stdout, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::archive;
-use crate::mail::{Mail, Page};
+use crate::filter::SubjectFilter;
+use crate::mail::{Page, SourceStatus};
 use crate::parse;
+use crate::source::{MailSource, StreamSource};
 use crate::ui;
 
 pub enum View {
@@ -40,9 +41,9 @@ pub struct App {
     cur_epoch: u32,
     current_repo: Option<PathBuf>,
 
-    /// Lazy cache of commit hashes per epoch, filtered by `filter` when set.
-    /// Populated on first visit to each epoch.
-    epoch_commits: HashMap<u32, Vec<String>>,
+    /// Where mails come from: the full unfiltered stream or an active subject
+    /// filter. Owns any per-source paging state (caches, pending page).
+    source: MailSource,
 
     page_size: usize,
     current_page: Page,
@@ -60,6 +61,7 @@ fn page_size_for_terminal() -> usize {
 
 impl App {
     pub fn new(list_name: String) -> Result<Self> {
+        let source = MailSource::Stream(StreamSource::new(list_name.clone(), Vec::new()));
         Ok(Self {
             list_name,
             filter: String::new(),
@@ -67,7 +69,7 @@ impl App {
             epoch_cursor: 0,
             cur_epoch: 0,
             current_repo: None,
-            epoch_commits: HashMap::new(),
+            source,
             page_size: page_size_for_terminal(),
             current_page: Page::default(),
             selected: 0,
@@ -126,149 +128,23 @@ impl App {
         Ok(())
     }
 
-    /// Reload from scratch: clear caches, reset to page 0, load.
+    /// Reload from scratch: drop to a fresh unfiltered stream, reset to page 0.
     pub fn refresh<W: Write>(&mut self, out: &mut W) -> Result<()> {
-        self.epoch_commits.clear();
+        self.source = MailSource::Stream(StreamSource::new(
+            self.list_name.clone(),
+            self.available_epochs.clone(),
+        ));
         self.current_page = Page::default();
         self.selected = 0;
         self.current_repo = Some(archive::local_repo_path(&self.list_name, self.cur_epoch));
-        self.load_page_at(0, out)?;
-        Ok(())
-    }
-
-    /// Load commit hashes for `epoch` into the cache, auto-cloning if needed.
-    /// When `filter` is set, keeps only commits whose subject matches.
-    fn ensure_epoch_commits<W: Write>(&mut self, epoch: u32, out: &mut W) -> Result<()> {
-        if self.epoch_commits.contains_key(&epoch) {
-            return Ok(());
-        }
-        if !archive::repo_exists(&self.list_name, epoch) {
-            let label = format!("Clone {} epoch {}? [y/N]: ", self.list_name, epoch);
-            let confirmed = self
-                .handle_prompt(&label, |k, _| match k.code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') => PromptAction::Accept(()),
-                    _ => PromptAction::Cancel,
-                })?
-                .is_some();
-            if !confirmed {
-                return Err(anyhow::anyhow!("declined to clone epoch {}", epoch));
-            }
-            let prev_view = std::mem::replace(
-                &mut self.view,
-                View::Loading(format!(
-                    "Cloning {} epoch {} (this may take a while)…",
-                    self.list_name, epoch
-                )),
-            );
-            let _ = self.render(out);
-            let clone_result = archive::clone_mirror(&self.list_name, epoch);
-            self.view = prev_view;
-            clone_result?;
-        }
-        let repo = archive::local_repo_path(&self.list_name, epoch);
-        let all_commits = archive::list_all_commits(&repo)?;
-
-        let needle = self.filter.trim().to_lowercase();
-        let commits = if needle.is_empty() {
-            all_commits
-        } else {
-            let prev_view = std::mem::replace(
-                &mut self.view,
-                View::Loading(format!("Filtering '{}' in epoch {}…", self.filter, epoch)),
-            );
-            let _ = self.render(out);
-            let mut matches: Vec<String> = Vec::new();
-            for commit in &all_commits {
-                if let Ok(raw) = archive::show_mail(&repo, commit) {
-                    let mail = archive::parse_mail_from_raw(&raw, epoch, commit.clone());
-                    if mail.title.to_lowercase().contains(&needle) {
-                        matches.push(commit.clone());
-                    }
-                }
-            }
-            self.view = prev_view;
-            matches
-        };
-
-        self.epoch_commits.insert(epoch, commits);
-        Ok(())
-    }
-
-    /// Walk epochs newest-first to collect `count` (epoch, commit) pairs
-    /// starting at global offset `offset`. Used when no filter is active.
-    fn resolve_stream_window<W: Write>(
-        &mut self,
-        offset: usize,
-        out: &mut W,
-    ) -> Result<Vec<(u32, String)>> {
-        let mut need = self.page_size;
-        let mut items: Vec<(u32, String)> = Vec::new();
-        let mut to_skip = offset;
-        let mut eidx = self.available_epochs.len() - 1;
-        loop {
-            if need == 0 {
-                break;
-            }
-            let epoch = self.available_epochs[eidx];
-            if self.ensure_epoch_commits(epoch, out).is_err() {
-                break;
-            }
-            let n = self
-                .epoch_commits
-                .get(&epoch)
-                .map(|v| v.len())
-                .unwrap_or(0);
-            if to_skip >= n {
-                to_skip -= n;
-            } else if n > 0 {
-                let start = to_skip;
-                let end = (start + need).min(n);
-                let commits = self.epoch_commits.get(&epoch).unwrap();
-                for c in &commits[start..end] {
-                    items.push((epoch, c.clone()));
-                }
-                need -= end - start;
-                to_skip = 0;
-            }
-            if eidx == 0 {
-                break;
-            }
-            eidx -= 1;
-        }
-        Ok(items)
-    }
-
-    /// Fetch and materialize a single Page at the given page index.
-    /// Returns an empty `Page` when past the end of the stream.
-    fn fetch_page<W: Write>(&mut self, page_idx: usize, out: &mut W) -> Result<Page> {
-        let start = page_idx * self.page_size;
-        let stream_slice = self.resolve_stream_window(start, out)?;
-        let mut mails: Vec<Mail> = Vec::with_capacity(stream_slice.len());
-        for (epoch, commit) in stream_slice {
-            let repo = archive::local_repo_path(&self.list_name, epoch);
-            if let Ok(raw) = archive::show_mail(&repo, &commit) {
-                mails.push(archive::parse_mail_from_raw(&raw, epoch, commit));
-            }
-        }
-        Ok(Page::new(mails, page_idx))
-    }
-
-
-    /// Fetch and display page `idx`. No-op when the fetched page is empty
-    /// (end-of-stream); current page is left untouched.
-    pub fn load_page_at<W: Write>(&mut self, idx: usize, out: &mut W) -> Result<()> {
-        let page = self.fetch_page(idx, out)?;
-        if page.is_empty() {
-            return Ok(());
-        }
-        self.current_page = page;
-        self.selected = 0;
+        self.resolve_page(0, out)?;
         Ok(())
     }
 
     pub fn next_page<W: Write>(&mut self, out: &mut W) -> Result<()> {
-        self.selected = 0;
-        self.load_page_at(self.current_page.page_idx + 1, out)
+        let target = self.current_page.page_idx + 1;
+        self.source.request_page(target);
+        self.resolve_page(target, out)
     }
 
     /// Step to the previous page, clamping at index 0.
@@ -276,15 +152,104 @@ impl App {
         if self.current_page.page_idx == 0 {
             return Ok(());
         }
-        self.load_page_at(self.current_page.page_idx - 1, out)
+        let target = self.current_page.page_idx - 1;
+        self.source.request_page(target);
+        self.resolve_page(target, out)
     }
 
+    /// (Re)start filtering from `self.filter`. With an empty filter, drop any
+    /// running job and fall back to the unfiltered stream.
     pub fn apply_filter<W: Write>(&mut self, out: &mut W) -> Result<()> {
-        self.epoch_commits.clear();
         self.current_page = Page::default();
         self.selected = 0;
-        self.load_page_at(0, out)?;
+
+        if self.filter.trim().is_empty() {
+            // Reassigning drops any previous filter, cancelling its worker.
+            self.source = MailSource::Stream(StreamSource::new(
+                self.list_name.clone(),
+                self.available_epochs.clone(),
+            ));
+            self.resolve_page(0, out)?;
+            return Ok(());
+        }
+
+        // Reassigning drops any previous filter, cancelling its worker.
+        self.source = MailSource::Filtered(SubjectFilter::start(
+            self.list_name.clone(),
+            self.filter.clone(),
+            &self.available_epochs,
+        ));
+        self.view = View::Loading(format!("Filtering '{}'…", self.filter));
         Ok(())
+    }
+
+    /// Advance any background work and, if a page is pending, try to serve it.
+    /// Returns true when the view changed and a redraw is warranted.
+    fn poll_source<W: Write>(&mut self, out: &mut W) -> Result<bool> {
+        self.source.poll();
+        match self.source.pending_page() {
+            Some(target) => {
+                self.resolve_page(target, out)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Drive the active source toward serving page `target`: show it when
+    /// ready, keep a loading screen up while work is pending, or prompt to
+    /// clone the next epoch when the source is blocked.
+    fn resolve_page<W: Write>(&mut self, target: usize, out: &mut W) -> Result<()> {
+        loop {
+            match self.source.status(target, self.page_size)? {
+                SourceStatus::Ready(page) => {
+                    self.current_page = page;
+                    self.selected = 0;
+                    self.view = View::List;
+                    self.source.clear_pending();
+                    return Ok(());
+                }
+                SourceStatus::Loading(message) => {
+                    self.view = View::Loading(message);
+                    return Ok(());
+                }
+                SourceStatus::Exhausted => {
+                    self.source.clear_pending();
+                    self.view = View::List;
+                    return Ok(());
+                }
+                SourceStatus::NeedsClone(epoch) => {
+                    if self.prompt_clone(epoch)? {
+                        self.view = View::Loading(format!(
+                            "Cloning {} epoch {} (this may take a while)…",
+                            self.list_name, epoch
+                        ));
+                        self.render(out)?;
+                        if archive::clone_mirror(&self.list_name, epoch).is_err() {
+                            self.source.clear_pending();
+                            self.view = View::List;
+                            return Ok(());
+                        }
+                        self.source.on_cloned(epoch);
+                    } else if !self.source.decline_clone(epoch) {
+                        self.source.clear_pending();
+                        self.view = View::List;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Prompt the user to confirm cloning `epoch`. Returns whether they agreed.
+    fn prompt_clone(&self, epoch: u32) -> Result<bool> {
+        let label = format!("Clone {} epoch {}? [y/N]: ", self.list_name, epoch);
+        Ok(self
+            .handle_prompt(&label, |k, _| match k.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => PromptAction::Accept(()),
+                _ => PromptAction::Cancel,
+            })?
+            .is_some())
     }
 
     pub fn open_selected(&mut self) -> Result<()> {
@@ -443,6 +408,9 @@ impl App {
 
     pub fn run_loop<W: Write>(&mut self, out: &mut W) -> Result<()> {
         loop {
+            if self.poll_source(out)? {
+                self.render(out)?;
+            }
             if event::poll(Duration::from_millis(250))? {
                 match event::read()? {
                     Event::Key(key) => {
@@ -459,7 +427,8 @@ impl App {
                         self.page_size = page_size_for_terminal();
                         let new_idx = prev_global / self.page_size;
                         self.selected = prev_global % self.page_size;
-                        let _ = self.load_page_at(new_idx, out);
+                        self.source.request_page(new_idx);
+                        let _ = self.resolve_page(new_idx, out);
                         self.render(out)?;
                     }
                     _ => {}
@@ -552,9 +521,17 @@ impl App {
                     if archive::update_mirror(&self.list_name, self.cur_epoch).is_ok() {
                         self.view = View::Loading("Reloading mails…".to_string());
                         self.render(out)?;
-                        let _ = self.refresh(out);
+                        if self.filter.trim().is_empty() {
+                            let _ = self.refresh(out);
+                            self.view = View::List;
+                        } else {
+                            // Re-run the background filter against the updated
+                            // mirror; apply_filter leaves the loading screen up.
+                            let _ = self.apply_filter(out);
+                        }
+                    } else {
+                        self.view = View::List;
                     }
-                    self.view = View::List;
                 }
                 KeyCode::Char('?') => self.view = View::Help,
                 _ => {}

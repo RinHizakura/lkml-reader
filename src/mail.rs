@@ -27,6 +27,18 @@ pub struct Page {
     pub page_idx: usize,
 }
 
+/// Outcome of asking a mail source whether a given page can be served yet.
+pub enum SourceStatus {
+    /// The page is ready.
+    Ready(Page),
+    /// Still working; show this loading message.
+    Loading(String),
+    /// Progress is blocked until this epoch is cloned.
+    NeedsClone(u32),
+    /// No more mails to show.
+    Exhausted,
+}
+
 impl Page {
     pub fn new(mails: Vec<Mail>, page_idx: usize) -> Self {
         Self { mails, page_idx }
