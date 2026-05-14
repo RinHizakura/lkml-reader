@@ -22,8 +22,51 @@ pub fn format_raw_mail(raw: &str) -> String {
         }
     }
     out.push_str("\n--\n\n");
-    out.push_str(body);
+
+    let encoding = extract_header(header_block, "Content-Transfer-Encoding")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if encoding.trim() == "quoted-printable" {
+        out.push_str(&decode_quoted_printable(body));
+    } else {
+        out.push_str(body);
+    }
     out
+}
+
+/// Decode an RFC 2045 quoted-printable body: join soft line breaks
+/// (`=` followed by CRLF or LF) and decode `=XX` hex escapes.
+fn decode_quoted_printable(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'=' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+            i += 2;
+            continue;
+        }
+        if i + 2 < bytes.len() && bytes[i + 1] == b'\r' && bytes[i + 2] == b'\n' {
+            i += 3;
+            continue;
+        }
+        if i + 2 < bytes.len() {
+            let h1 = (bytes[i + 1] as char).to_digit(16);
+            let h2 = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(a), Some(b)) = (h1, h2) {
+                out.push(((a << 4) | b) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b'=');
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 pub fn extract_header(headers: &str, name: &str) -> Option<String> {
