@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
+use std::thread;
 
 use anyhow::Result;
 
 use crate::archive;
-use crate::filter::SubjectFilter;
-use crate::mail::{Page, SourceStatus};
+use crate::filter::{DateFilter, SubjectFilter};
+use crate::mail::{Mail, Page, SourceStatus};
 
 /// The unfiltered mail stream: every mail across all epochs, newest-first.
 /// Pages are materialized lazily by walking epochs only as far as needed, with
@@ -93,12 +97,197 @@ impl StreamSource {
     }
 }
 
+/// A background filtered scan. A worker thread streams matching mails over
+/// `rx`; the owner drains them into `results` via `poll` and serves pages from
+/// there. Dropping the source cancels its worker.
+pub struct FilteredSource {
+    list_name: String,
+    subject: SubjectFilter,
+    date: DateFilter,
+    rx: Receiver<Mail>,
+    cancel: Arc<AtomicBool>,
+    results: Vec<Mail>,
+    /// The current worker thread has finished scanning its epochs.
+    done: bool,
+    /// Epochs not present locally, newest-first, awaiting on-demand clone.
+    uncloned: Vec<u32>,
+    /// Page index awaited while the worker collects enough matches.
+    pending_page: Option<usize>,
+}
+
+impl FilteredSource {
+    /// Start a background scan over `available_epochs` for mails matching the
+    /// given filters. At least one filter should be active; an entirely inert
+    /// pair is allowed but pointless (caller should use the unfiltered stream
+    /// instead). Epochs present locally are scanned right away; the rest are
+    /// queued for on-demand cloning.
+    pub fn start(
+        list_name: String,
+        subject: SubjectFilter,
+        date: DateFilter,
+        available_epochs: &[u32],
+    ) -> Self {
+        let mut scan: Vec<u32> = Vec::new();
+        let mut uncloned: Vec<u32> = Vec::new();
+        for &epoch in available_epochs.iter().rev() {
+            if archive::repo_exists(&list_name, epoch) {
+                scan.push(epoch);
+            } else {
+                uncloned.push(epoch);
+            }
+        }
+        let (rx, cancel) = spawn_worker(list_name.clone(), scan, subject.clone(), date.clone());
+        Self {
+            list_name,
+            subject,
+            date,
+            rx,
+            cancel,
+            results: Vec::new(),
+            done: false,
+            uncloned,
+            pending_page: Some(0),
+        }
+    }
+
+    pub fn pending_page(&self) -> Option<usize> {
+        self.pending_page
+    }
+
+    pub fn request_page(&mut self, page_idx: usize) {
+        self.pending_page = Some(page_idx);
+    }
+
+    pub fn clear_pending(&mut self) {
+        self.pending_page = None;
+    }
+
+    /// Drain the worker's channel into `results`.
+    pub fn poll(&mut self) {
+        loop {
+            match self.rx.try_recv() {
+                Ok(mail) => self.results.push(mail),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.done = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn page(&self, page_idx: usize, page_size: usize) -> Page {
+        let start = page_idx * page_size;
+        let end = (start + page_size).min(self.results.len());
+        let mails = self
+            .results
+            .get(start..end)
+            .map(|s| s.to_vec())
+            .unwrap_or_default();
+        Page::new(mails, page_idx)
+    }
+
+    /// Decide whether `page_idx` can be served yet: ready once enough matches
+    /// exist (or the worker is done), otherwise loading, or — when the scan is
+    /// done and results run out — the next epoch to clone.
+    pub fn status(&self, page_idx: usize, page_size: usize) -> SourceStatus {
+        let start = page_idx * page_size;
+        let needed = start + page_size;
+        let len = self.results.len();
+
+        if len >= needed || (self.done && start < len) {
+            SourceStatus::Ready(self.page(page_idx, page_size))
+        } else if self.done {
+            match self.uncloned.first().copied() {
+                Some(epoch) => SourceStatus::NeedsClone(epoch),
+                None => SourceStatus::Exhausted,
+            }
+        } else {
+            SourceStatus::Loading(format!(
+                "Filtering subject='{}' date='{}'… ({} match{} so far)",
+                self.subject,
+                self.date,
+                len,
+                if len == 1 { "" } else { "es" }
+            ))
+        }
+    }
+
+    pub fn discard_uncloned(&mut self, epoch: u32) {
+        self.uncloned.retain(|&e| e != epoch);
+    }
+
+    /// Resume scanning over `epoch` — just cloned — so its matches are appended
+    /// to the existing results.
+    pub fn extend(&mut self, epoch: u32) {
+        self.discard_uncloned(epoch);
+        let (rx, cancel) = spawn_worker(
+            self.list_name.clone(),
+            vec![epoch],
+            self.subject.clone(),
+            self.date.clone(),
+        );
+        self.rx = rx;
+        self.cancel = cancel;
+        self.done = false;
+    }
+}
+
+impl Drop for FilteredSource {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Spawn a worker that scans `epochs` (newest-first) and sends every mail that
+/// satisfies both filters. Stops promptly when `cancel` is set or the receiver
+/// is dropped.
+fn spawn_worker(
+    list: String,
+    epochs: Vec<u32>,
+    subject: SubjectFilter,
+    date: DateFilter,
+) -> (Receiver<Mail>, Arc<AtomicBool>) {
+    let (tx, rx) = mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_worker = cancel.clone();
+    thread::spawn(move || {
+        for epoch in epochs {
+            if cancel_worker.load(Ordering::Relaxed) {
+                return;
+            }
+            let repo = archive::local_repo_path(&list, epoch);
+            if !repo.exists() {
+                continue;
+            }
+            let Ok(commits) = archive::list_all_commits(&repo) else {
+                continue;
+            };
+            for commit in commits {
+                if cancel_worker.load(Ordering::Relaxed) {
+                    return;
+                }
+                if let Ok(raw) = archive::show_mail(&repo, &commit) {
+                    let mail = archive::parse_mail_from_raw(&raw, epoch, commit);
+                    if subject.matches(&mail.title)
+                        && date.matches(mail.date.as_ref())
+                        && tx.send(mail).is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    (rx, cancel)
+}
+
 /// Where `App` pulls mails from: either the full unfiltered stream or an active
-/// background subject filter. Both answer the same "give me page N" question
+/// background filtered scan. Both answer the same "give me page N" question
 /// through `status`, so `App` can drive them with one code path.
 pub enum MailSource {
     Stream(StreamSource),
-    Filtered(SubjectFilter),
+    Filtered(FilteredSource),
 }
 
 impl MailSource {

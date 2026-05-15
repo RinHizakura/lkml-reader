@@ -1,8 +1,54 @@
 // SPDX-License-Identifier: GPL-2.0
 
+use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
+
 use crate::archive;
 
-pub fn format_raw_mail(raw: &str) -> String {
+fn local_midnight_to_utc(date: NaiveDate) -> Result<DateTime<Utc>> {
+    let naive = date.and_hms_opt(0, 0, 0).context("date overflow")?;
+    Local
+        .from_local_datetime(&naive)
+        .single()
+        .context("ambiguous local time")
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn parse_local_datetime(s: &str) -> Result<DateTime<Utc>> {
+    let naive = NaiveDateTime::parse_from_str(s, "%Y/%m/%d %H:%M")
+        .context("expected YYYY/MM/DD HH:MM")?;
+    Local
+        .from_local_datetime(&naive)
+        .single()
+        .context("ambiguous local time")
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+/// Parse user-entered date filter text into a half-open UTC range. Accepts:
+///   - `today`
+///   - `yesterday`
+///   - `YYYY/MM/DD HH:MM to YYYY/MM/DD HH:MM`
+pub fn parse_date_range(trimmed: &str) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+    let lower = trimmed.to_lowercase();
+    if lower == "today" {
+        let today = Local::now().date_naive();
+        let tomorrow = today.succ_opt().context("date overflow")?;
+        return Ok((local_midnight_to_utc(today)?, local_midnight_to_utc(tomorrow)?));
+    }
+    if lower == "yesterday" {
+        let today = Local::now().date_naive();
+        let yesterday = today.pred_opt().context("date underflow")?;
+        return Ok((local_midnight_to_utc(yesterday)?, local_midnight_to_utc(today)?));
+    }
+    let Some((start_s, end_s)) = trimmed.split_once(" to ") else {
+        bail!("expected 'today', 'yesterday', or '<start> to <end>'");
+    };
+    let start = parse_local_datetime(start_s.trim()).context("parsing start date")?;
+    let end = parse_local_datetime(end_s.trim()).context("parsing end date")?;
+    Ok((start, end))
+}
+
+pub fn parse_mail(raw: &str) -> String {
     let header_end = raw
         .find("\r\n\r\n")
         .map(|i| (i, 4))
@@ -14,7 +60,7 @@ pub fn format_raw_mail(raw: &str) -> String {
 
     let mut out = String::new();
     for field in ["From", "Date", "Subject", "To", "Cc", "Message-ID"] {
-        if let Some(v) = extract_header(header_block, field) {
+        if let Some(v) = parse_header(header_block, field) {
             out.push_str(field);
             out.push_str(": ");
             out.push_str(&archive::decode_mime_header(&v));
@@ -23,7 +69,7 @@ pub fn format_raw_mail(raw: &str) -> String {
     }
     out.push_str("\n--\n\n");
 
-    let encoding = extract_header(header_block, "Content-Transfer-Encoding")
+    let encoding = parse_header(header_block, "Content-Transfer-Encoding")
         .unwrap_or_default()
         .to_ascii_lowercase();
     if encoding.trim() == "quoted-printable" {
@@ -69,7 +115,7 @@ fn decode_quoted_printable(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-pub fn extract_header(headers: &str, name: &str) -> Option<String> {
+pub fn parse_header(headers: &str, name: &str) -> Option<String> {
     let target = name.to_lowercase();
     let mut iter = headers.lines().peekable();
     while let Some(line) = iter.next() {
