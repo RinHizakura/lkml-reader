@@ -10,6 +10,10 @@ keyboard-friendly way to keep up with the latest discussions in the Linux kernel
 community.
 
 
+## Demo
+
+[![asciicast](https://asciinema.org/a/ZgQq2duxIBajzq5r.svg)](https://asciinema.org/a/ZgQq2duxIBajzq5r)
+
 ## Features (MVP)
 
 - Pick any mailing list on lore.kernel.org (`linux-pm`, `linux-mm`,
