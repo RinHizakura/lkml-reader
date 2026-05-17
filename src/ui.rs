@@ -90,12 +90,20 @@ pub fn draw_detail<W: Write>(out: &mut W, view: &DetailView) -> Result<()> {
 }
 
 pub fn redraw_prompt<W: Write>(out: &mut W, label: &str, input: &str, y: u16) -> Result<()> {
+    let (cols, _) = size()?;
+    let max_w = (cols as usize).saturating_sub(1);
+    let combined = format!("{}{}", label, input);
+    let total = combined.chars().count();
+    let display: String = if total > max_w {
+        combined.chars().skip(total - max_w).collect()
+    } else {
+        combined
+    };
     execute!(
         out,
         MoveTo(0, y),
         Clear(ClearType::CurrentLine),
-        Print(label),
-        Print(input),
+        Print(display),
         Show
     )?;
     out.flush()?;
