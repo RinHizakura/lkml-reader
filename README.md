@@ -9,6 +9,10 @@ to browse and read mails. The main goal is to have a simple, fast, and
 keyboard-friendly way to keep up with the latest discussions in the Linux kernel
 community.
 
+## Demo
+
+![Terminal Demo](artifacts/demo.gif)
+
 ## Features
 
 - Pick any mailing list on lore.kernel.org (`linux-pm`, `linux-mm`,
