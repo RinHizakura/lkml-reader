@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+test -d .git || { echo "Run scripts/install-git-hooks from the repo top-level." >&2; exit 1; }
+ln -sf ../../scripts/pre-commit.hook .git/hooks/pre-commit
+chmod +x .git/hooks/pre-commit
+echo "Git hooks installed."
