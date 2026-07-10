@@ -287,8 +287,10 @@ impl Drop for FilteredSource {
 }
 
 /// Spawn a worker that scans `epochs` (newest-first) and sends every mail that
-/// satisfies all filters. Stops promptly when `cancel` is set or the receiver
-/// is dropped.
+/// satisfies all filters. Subject and author are pushed down into `git log`,
+/// which narrows a whole epoch in about a second; only the surviving commits
+/// are read and parsed, and the date filter runs on those. Stops promptly when
+/// `cancel` is set or the receiver is dropped.
 fn spawn_worker(
     list: String,
     epochs: Vec<u32>,
@@ -307,7 +309,12 @@ fn spawn_worker(
             if !archive::repo_exists(&list, epoch) {
                 continue;
             }
-            let Ok(commits) = archive::list_all_commits(&list, epoch) else {
+            let Ok(commits) = archive::search_commits(
+                &list,
+                epoch,
+                subject.needle.as_deref(),
+                author.needle.as_deref(),
+            ) else {
                 continue;
             };
             for commit in commits {
@@ -315,11 +322,7 @@ fn spawn_worker(
                     return;
                 }
                 if let Ok(mail) = mail::fetch(&list, epoch, &commit) {
-                    if subject.matches(&mail)
-                        && author.matches(&mail)
-                        && date.matches(&mail)
-                        && tx.send(mail).is_err()
-                    {
+                    if date.matches(&mail) && tx.send(mail).is_err() {
                         return;
                     }
                 }
