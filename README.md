@@ -24,6 +24,8 @@ community.
   `YYYY/MM/DD HH:MM to YYYY/MM/DD HH:MM`).
 - Read the raw mail in a scrollable detail pane with diff-aware coloring
   (green `+`, red `-`, cyan `@@`).
+- Reply to a mail with `r`: edit the draft in `$EDITOR`, send with
+  `git send-email` (see [Replying](#replying)).
 
 ## Build & run
 
