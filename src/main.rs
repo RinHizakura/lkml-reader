@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 
 mod app;
+mod reply;
 mod source;
 mod ui;
 

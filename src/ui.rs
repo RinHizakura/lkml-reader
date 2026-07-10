@@ -345,6 +345,7 @@ fn draw_help_body<W: Write>(out: &mut W, cols: u16, bottom: u16) -> Result<()> {
         "  →          next page",
         "  ←          previous page",
         "  Enter      open selected mail",
+        "  r          reply to selected mail ($EDITOR, then git send-email)",
         "  /          set subject filter (scans in the background; pages open as matches arrive)",
         "  d          set date filter (today | yesterday | YYYY/MM/DD HH:MM to YYYY/MM/DD HH:MM)",
         "  u          update current mirror (git remote update on the latest epoch)",
@@ -352,7 +353,7 @@ fn draw_help_body<W: Write>(out: &mut W, cols: u16, bottom: u16) -> Result<()> {
         "  Detail view:",
         "    ↑/↓/PgUp/PgDn scroll   Space = page down",
         "    g / G    jump to top / bottom",
-        "    Esc / q  back to list",
+        "    r        reply   Esc / q  back to list",
         "",
         "Press any key to return.",
     ];

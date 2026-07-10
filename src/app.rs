@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use lkml_core::archive;
 use lkml_core::filter::{DateFilter, Filter, SubjectFilter};
 
+use crate::reply;
 use crate::source::{FilteredSource, MailSource, Page, SourceStatus, StreamSource};
 use crate::ui;
 
@@ -314,6 +315,30 @@ impl App {
         Ok(())
     }
 
+    /// Reply to the selected mail: drop out of the TUI so `$EDITOR` and
+    /// `git send-email` own the terminal, then restore it either way.
+    fn reply_selected<W: Write>(&mut self, out: &mut W) -> Result<()> {
+        let Some(draft) = self
+            .current_page
+            .mails
+            .get(self.selected)
+            .map(|mail| mail.reply_draft())
+        else {
+            return Ok(());
+        };
+
+        disable_raw_mode()?;
+        execute!(out, LeaveAlternateScreen)?;
+        let result = reply::compose_and_send(&draft);
+        enable_raw_mode()?;
+        execute!(out, EnterAlternateScreen)?;
+
+        if let Err(e) = result {
+            self.view = View::Loading(format!("Reply not sent: {e}"));
+        }
+        Ok(())
+    }
+
     /// Build per-view structs from current state and dispatch to ui::draw_*.
     /// Dispatch to the per-view renderer based on `self.view`.
     pub fn render<W: Write>(&self, out: &mut W) -> Result<()> {
@@ -561,6 +586,7 @@ impl App {
                 KeyCode::Enter => {
                     let _ = self.open_selected();
                 }
+                KeyCode::Char('r') => self.reply_selected(out)?,
                 KeyCode::Char('/') => {
                     let label = format!(
                         "Filter (subject substring, empty=clear) [{}]: ",
@@ -639,6 +665,7 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => {
                     self.view = View::List;
                 }
+                KeyCode::Char('r') => self.reply_selected(out)?,
                 KeyCode::Down => self.detail_scroll += 1,
                 KeyCode::Up => self.detail_scroll = self.detail_scroll.saturating_sub(1),
                 KeyCode::PageDown | KeyCode::Char(' ') => self.detail_scroll += 20,

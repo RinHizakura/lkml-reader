@@ -58,6 +58,7 @@ Defaults: `--list lkml`.
 | List   | `↑` / `↓`              | Move selection within page      |
 | List   | `←` / `→`              | Previous / next page            |
 | List   | `Enter`                | Open mail                       |
+| List   | `r`                    | Reply to mail (see [Replying](#replying)) |
 | List   | `/`                    | Set subject filter (lazy per-epoch, auto-clones older epochs as you page) |
 | List   | `d`                    | Set date filter                 |
 | List   | `u`                    | Update current mirror (`git remote update`) |
@@ -65,5 +66,24 @@ Defaults: `--list lkml`.
 | List   | `q`                    | Quit                            |
 | Detail | `↑`/`↓`, `PgUp`/`PgDn` | Scroll                          |
 | Detail | `g` / `G`              | Top / bottom                    |
+| Detail | `r`                    | Reply to mail (see [Replying](#replying)) |
 | Detail | `Esc` / `q`            | Back to list                    |
+
+## Replying
+
+`r` builds a reply draft: open it in `$EDITOR`, and sends it with `git send-email`.
+
+Your identity and mail server come from git. Configure them once:
+
+```sh
+git config --global user.name "Your Name"
+git config --global user.email you@example.org
+git config --global sendemail.smtpServer smtp.example.org
+git config --global sendemail.smtpUser you@example.org
+git config --global sendemail.smtpEncryption tls
+git config --global sendemail.smtpServerPort 587
+```
+
+`git help send-email` covers the rest, including using a local `msmtp`/`sendmail`
+instead of SMTP, and keeping the password out of the config file.
 
