@@ -20,6 +20,8 @@ community.
 - Filter by subsystem interactively with `/` (case-insensitive substring match
   against the subject, e.g. `sched` matches `[PATCH sched/core]`, `[sched]`,
   `[scheduler]`).
+- Filter by author with `a` (case-insensitive substring of the `From` header,
+  so both the display name and the address match).
 - Filter by date range with `d` (`today`, `yesterday`, or
   `YYYY/MM/DD HH:MM to YYYY/MM/DD HH:MM`).
 - Read the raw mail in a scrollable detail pane with diff-aware coloring
@@ -62,6 +64,7 @@ Defaults: `--list lkml`.
 | List   | `Enter`                | Open mail                       |
 | List   | `r`                    | Reply to mail (see [Replying](#replying)) |
 | List   | `/`                    | Set subject filter (lazy per-epoch, auto-clones older epochs as you page) |
+| List   | `a`                    | Set author filter (`From` substring: name or address) |
 | List   | `d`                    | Set date filter                 |
 | List   | `u`                    | Update current mirror (`git remote update`) |
 | List   | `?`                    | Help                            |

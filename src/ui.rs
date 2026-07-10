@@ -11,14 +11,15 @@ use crossterm::{
 };
 use std::io::Write;
 
-use lkml_core::filter::{DateFilter, SubjectFilter};
+use lkml_core::filter::{DateFilter, NameFilter};
 use lkml_core::mail::Mail;
 
 pub struct HeaderInfo<'a> {
     pub list_name: &'a str,
     pub epoch_label: &'a str,
     pub page_label: &'a str,
-    pub subject_filter: &'a SubjectFilter,
+    pub subject_filter: &'a NameFilter,
+    pub author_filter: &'a NameFilter,
     pub date_filter: &'a DateFilter,
 }
 
@@ -67,7 +68,7 @@ pub fn draw_list<W: Write>(out: &mut W, view: &ListView) -> Result<()> {
     draw_list_body(out, view, cols, bottom)?;
     draw_hotkeys(
         out,
-        "↑/↓ select  ←/→ page  Enter view  r reply  / subject  d date  u update  ? help  q quit",
+        "↑/↓ select  ←/→ page  Enter view  r reply  / subject  a author  d date  u update  ? help  q quit",
         cols,
         rows,
     )?;
@@ -134,8 +135,8 @@ fn begin_frame<W: Write>(out: &mut W) -> Result<()> {
 
 fn draw_header<W: Write>(out: &mut W, h: &HeaderInfo, cols: u16) -> Result<()> {
     let title = format!(
-        " LKML Reader  —  list: {}   epoch: {}   page: {}   subject: {}   date: {}",
-        h.list_name, h.epoch_label, h.page_label, h.subject_filter, h.date_filter,
+        " LKML Reader  —  list: {}   epoch: {}   page: {}   subject: {}   author: {}   date: {}",
+        h.list_name, h.epoch_label, h.page_label, h.subject_filter, h.author_filter, h.date_filter,
     );
     queue!(
         out,
@@ -347,6 +348,7 @@ fn draw_help_body<W: Write>(out: &mut W, cols: u16, bottom: u16) -> Result<()> {
         "  Enter      open selected mail",
         "  r          reply to selected mail ($EDITOR, then git send-email)",
         "  /          set subject filter (scans in the background; pages open as matches arrive)",
+        "  a          set author filter (substring of the From header: name or address)",
         "  d          set date filter (today | yesterday | YYYY/MM/DD HH:MM to YYYY/MM/DD HH:MM)",
         "  u          update current mirror (git remote update on the latest epoch)",
         "",

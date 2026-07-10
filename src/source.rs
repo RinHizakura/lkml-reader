@@ -14,7 +14,7 @@ use std::thread;
 use anyhow::Result;
 
 use lkml_core::archive;
-use lkml_core::filter::{DateFilter, Filter, SubjectFilter};
+use lkml_core::filter::{DateFilter, Filter, NameFilter};
 use lkml_core::mail::{self, Mail};
 
 /// A single screen of mails. Renders as one TUI page.
@@ -138,7 +138,8 @@ impl StreamSource {
 /// there. Dropping the source cancels its worker.
 pub struct FilteredSource {
     list_name: String,
-    subject: SubjectFilter,
+    subject: NameFilter,
+    author: NameFilter,
     date: DateFilter,
     rx: Receiver<Mail>,
     cancel: Arc<AtomicBool>,
@@ -154,12 +155,13 @@ pub struct FilteredSource {
 impl FilteredSource {
     /// Start a background scan over `available_epochs` for mails matching the
     /// given filters. At least one filter should be active; an entirely inert
-    /// pair is allowed but pointless (caller should use the unfiltered stream
+    /// set is allowed but pointless (caller should use the unfiltered stream
     /// instead). Epochs present locally are scanned right away; the rest are
     /// queued for on-demand cloning.
     pub fn start(
         list_name: String,
-        subject: SubjectFilter,
+        subject: NameFilter,
+        author: NameFilter,
         date: DateFilter,
         available_epochs: &[u32],
     ) -> Self {
@@ -172,10 +174,17 @@ impl FilteredSource {
                 uncloned.push(epoch);
             }
         }
-        let (rx, cancel) = spawn_worker(list_name.clone(), scan, subject.clone(), date.clone());
+        let (rx, cancel) = spawn_worker(
+            list_name.clone(),
+            scan,
+            subject.clone(),
+            author.clone(),
+            date.clone(),
+        );
         Self {
             list_name,
             subject,
+            author,
             date,
             rx,
             cancel,
@@ -240,8 +249,9 @@ impl FilteredSource {
             }
         } else {
             SourceStatus::Loading(format!(
-                "Filtering subject='{}' date='{}'… ({} match{} so far)",
+                "Filtering subject='{}' author='{}' date='{}'… ({} match{} so far)",
                 self.subject,
+                self.author,
                 self.date,
                 len,
                 if len == 1 { "" } else { "es" }
@@ -261,6 +271,7 @@ impl FilteredSource {
             self.list_name.clone(),
             vec![epoch],
             self.subject.clone(),
+            self.author.clone(),
             self.date.clone(),
         );
         self.rx = rx;
@@ -276,12 +287,13 @@ impl Drop for FilteredSource {
 }
 
 /// Spawn a worker that scans `epochs` (newest-first) and sends every mail that
-/// satisfies both filters. Stops promptly when `cancel` is set or the receiver
+/// satisfies all filters. Stops promptly when `cancel` is set or the receiver
 /// is dropped.
 fn spawn_worker(
     list: String,
     epochs: Vec<u32>,
-    subject: SubjectFilter,
+    subject: NameFilter,
+    author: NameFilter,
     date: DateFilter,
 ) -> (Receiver<Mail>, Arc<AtomicBool>) {
     let (tx, rx) = mpsc::channel();
@@ -303,7 +315,11 @@ fn spawn_worker(
                     return;
                 }
                 if let Ok(mail) = mail::fetch(&list, epoch, &commit) {
-                    if subject.matches(&mail) && date.matches(&mail) && tx.send(mail).is_err() {
+                    if subject.matches(&mail)
+                        && author.matches(&mail)
+                        && date.matches(&mail)
+                        && tx.send(mail).is_err()
+                    {
                         return;
                     }
                 }

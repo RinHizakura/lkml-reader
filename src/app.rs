@@ -12,7 +12,7 @@ use std::io::{stdout, Write};
 use std::time::{Duration, Instant};
 
 use lkml_core::archive;
-use lkml_core::filter::{DateFilter, Filter, SubjectFilter};
+use lkml_core::filter::{DateFilter, Filter, NameFilter};
 
 use crate::reply;
 use crate::source::{FilteredSource, MailSource, Page, SourceStatus, StreamSource};
@@ -33,7 +33,8 @@ enum PromptAction<R> {
 
 pub struct App {
     list_name: String,
-    subject_filter: SubjectFilter,
+    subject_filter: NameFilter,
+    author_filter: NameFilter,
     date_filter: DateFilter,
 
     available_epochs: Vec<u32>,
@@ -73,7 +74,8 @@ impl App {
         let source = MailSource::Stream(StreamSource::new(list_name.clone(), Vec::new()));
         Ok(Self {
             list_name,
-            subject_filter: SubjectFilter::new(),
+            subject_filter: NameFilter::subject(),
+            author_filter: NameFilter::author(),
             date_filter: DateFilter::new(),
             available_epochs: Vec::new(),
             epoch_cursor: 0,
@@ -199,14 +201,21 @@ impl App {
         self.resolve_page(target, out)
     }
 
-    /// (Re)start filtering from the current subject and date constraints. When
-    /// neither is active, drop any running job and fall back to the unfiltered
-    /// stream.
+    /// Whether any filter constrains the stream.
+    fn any_filter_active(&self) -> bool {
+        self.subject_filter.is_active()
+            || self.author_filter.is_active()
+            || self.date_filter.is_active()
+    }
+
+    /// (Re)start filtering from the current subject, author and date
+    /// constraints. When none is active, drop any running job and fall back to
+    /// the unfiltered stream.
     pub fn apply_filter<W: Write>(&mut self, out: &mut W) -> Result<()> {
         self.current_page = Page::default();
         self.selected = 0;
 
-        if !self.subject_filter.is_active() && !self.date_filter.is_active() {
+        if !self.any_filter_active() {
             // Reassigning drops any previous filter, cancelling its worker.
             self.source = MailSource::Stream(StreamSource::new(
                 self.list_name.clone(),
@@ -220,12 +229,13 @@ impl App {
         self.source = MailSource::Filtered(FilteredSource::start(
             self.list_name.clone(),
             self.subject_filter.clone(),
+            self.author_filter.clone(),
             self.date_filter.clone(),
             &self.available_epochs,
         ));
         self.view = View::Loading(format!(
-            "Filtering subject='{}' date='{}'…",
-            self.subject_filter, self.date_filter
+            "Filtering subject='{}' author='{}' date='{}'…",
+            self.subject_filter, self.author_filter, self.date_filter
         ));
         Ok(())
     }
@@ -395,10 +405,10 @@ impl App {
                     format!("No local mirror for list '{}'.", self.list_name),
                     "The TUI clones the latest epoch automatically — check your network and try again.".to_string(),
                 ]
-            } else if !self.subject_filter.is_active() && !self.date_filter.is_active() {
+            } else if !self.any_filter_active() {
                 vec!["No mails on this page.".to_string()]
             } else {
-                vec!["No mails match filter. Press '/' or 'd' to change it.".to_string()]
+                vec!["No mails match filter. Press '/', 'a' or 'd' to change it.".to_string()]
             }
         } else {
             Vec::new()
@@ -447,6 +457,7 @@ impl App {
             epoch_label,
             page_label,
             subject_filter: &self.subject_filter,
+            author_filter: &self.author_filter,
             date_filter: &self.date_filter,
         }
     }
@@ -609,6 +620,28 @@ impl App {
                         let _ = self.apply_filter(out);
                     }
                 }
+                KeyCode::Char('a') => {
+                    let label = format!(
+                        "Filter (author substring, empty=clear) [{}]: ",
+                        self.author_filter
+                    );
+                    if let Some(s) = self.handle_prompt(&label, |k, input| match k.code {
+                        KeyCode::Enter => PromptAction::Accept(input.clone()),
+                        KeyCode::Esc => PromptAction::Cancel,
+                        KeyCode::Backspace => {
+                            input.pop();
+                            PromptAction::Continue
+                        }
+                        KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+                            input.push(c);
+                            PromptAction::Continue
+                        }
+                        _ => PromptAction::Continue,
+                    })? {
+                        self.author_filter.set(&s);
+                        let _ = self.apply_filter(out);
+                    }
+                }
                 KeyCode::Char('d') => {
                     let label = format!(
                         "Filter date (today | yesterday | YYYY/MM/DD HH:MM to YYYY/MM/DD HH:MM, empty=clear) [{}]: ",
@@ -646,7 +679,7 @@ impl App {
                     if archive::ensure_epoch(&self.list_name, self.cur_epoch).is_ok() {
                         self.view = View::Loading("Reloading mails…".to_string());
                         self.render(out)?;
-                        if !self.subject_filter.is_active() && !self.date_filter.is_active() {
+                        if !self.any_filter_active() {
                             let _ = self.refresh(out);
                             self.view = View::List;
                         } else {
