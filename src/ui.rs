@@ -67,7 +67,7 @@ pub fn draw_list<W: Write>(out: &mut W, view: &ListView) -> Result<()> {
     draw_list_body(out, view, cols, bottom)?;
     draw_hotkeys(
         out,
-        "↑/↓ select  ←/→ page  Enter view  / subject  d date  u update  ? help  q quit",
+        "↑/↓ select  ←/→ page  Enter view  r reply  / subject  d date  u update  ? help  q quit",
         cols,
         rows,
     )?;
@@ -83,7 +83,7 @@ pub fn draw_detail<W: Write>(out: &mut W, view: &DetailView) -> Result<()> {
     draw_detail_body(out, view.text, view.scroll, cols, bottom)?;
     draw_hotkeys(
         out,
-        "↑/↓/PgUp/PgDn scroll  g/G top/bottom  Esc/q back",
+        "↑/↓/PgUp/PgDn scroll  g/G top/bottom  r reply  Esc/q back",
         cols,
         rows,
     )?;
