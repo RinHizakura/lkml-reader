@@ -187,11 +187,9 @@ impl App {
         self.view = View::Loading(format!("Fetching manifest for '{}'…", self.list_name));
         self.render(out)?;
 
-        /* Ask the archive module for the list's epochs; it owns the HTTP
-         * client and manifest parsing. A network failure here is non-fatal: we
-         * fall through to whatever mirror may already be cached locally. */
+        // A network failure here is non-fatal: fall through to whatever mirror
+        // is already cached locally.
         if let Ok(epochs) = archive::list_epochs(&self.list_name) {
-            /* Start at the latest epoch. */
             self.available_epochs = epochs;
             self.update_cur_epoch(self.available_epochs.len() - 1);
         }
@@ -211,12 +209,9 @@ impl App {
         self.view = View::Loading(loading_message);
         self.render(out)?;
 
-        /* The archive module decides clone-vs-update; `exists` above only
-         * picks the right loading message. */
+        // The archive module decides clone-vs-update; `exists` above only picks
+        // the right loading message.
         archive::ensure_epoch(&self.list_name, self.cur_epoch)?;
-
-        /* Assume the mirror is up-to-date and always exists after this. */
-
         Ok(())
     }
 
@@ -263,8 +258,8 @@ impl App {
         self.current_page = Page::default();
         self.selected = 0;
 
+        // Reassigning self.source drops the previous one, cancelling its worker.
         if !self.any_filter_active() {
-            // Reassigning drops any previous filter, cancelling its worker.
             self.source = MailSource::Stream(StreamSource::new(
                 self.list_name.clone(),
                 self.available_epochs.clone(),
@@ -273,7 +268,6 @@ impl App {
             return Ok(());
         }
 
-        // Reassigning drops any previous filter, cancelling its worker.
         self.source = MailSource::Filtered(FilteredSource::start(
             self.list_name.clone(),
             self.subject_filter.clone(),
@@ -555,7 +549,7 @@ impl App {
     }
 
     fn page_label(&self) -> String {
-        format!("{}", self.current_page.page_idx + 1)
+        (self.current_page.page_idx + 1).to_string()
     }
 
     pub fn run(&mut self) -> Result<()> {
