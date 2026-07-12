@@ -36,8 +36,8 @@ pub fn apply(repo: &str, patches: &[Mail]) -> Result<()> {
 
     let expected = patches
         .iter()
-        .filter_map(|m| m.patch_nums)
-        .map(|(_, m)| m as usize)
+        .filter_map(|m| m.patch_tag)
+        .map(|t| t.total as usize)
         .max()
         .unwrap_or(1);
     if patches.len() != expected {

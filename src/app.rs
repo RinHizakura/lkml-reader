@@ -368,7 +368,7 @@ impl App {
         let Some(mail) = self.current_page.mails.get(self.selected).cloned() else {
             return Ok(());
         };
-        if mail.patch_nums.is_none() {
+        if mail.patch_tag.is_none() {
             self.handle_prompt::<_, ()>("Not a patch mail. Press any key.", |_, _| {
                 PromptAction::Cancel
             })?;
