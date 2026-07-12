@@ -20,7 +20,7 @@ use crate::reply;
 use crate::source::{FilteredSource, MailSource, Page, SourceStatus, StreamSource};
 use crate::ui;
 
-pub enum View {
+enum View {
     Loading(String),
     List,
     Detail,
@@ -216,7 +216,7 @@ impl App {
     }
 
     /// Reload from scratch: drop to a fresh unfiltered stream, reset to page 0.
-    pub fn refresh<W: Write>(&mut self, out: &mut W) -> Result<()> {
+    fn refresh<W: Write>(&mut self, out: &mut W) -> Result<()> {
         self.source = MailSource::Stream(StreamSource::new(
             self.list_name.clone(),
             self.available_epochs.clone(),
@@ -228,14 +228,14 @@ impl App {
         Ok(())
     }
 
-    pub fn next_page<W: Write>(&mut self, out: &mut W) -> Result<()> {
+    fn next_page<W: Write>(&mut self, out: &mut W) -> Result<()> {
         let target = self.current_page.page_idx + 1;
         self.source.request_page(target);
         self.resolve_page(target, out)
     }
 
     /// Step to the previous page, clamping at index 0.
-    pub fn prev_page<W: Write>(&mut self, out: &mut W) -> Result<()> {
+    fn prev_page<W: Write>(&mut self, out: &mut W) -> Result<()> {
         if self.current_page.page_idx == 0 {
             return Ok(());
         }
@@ -254,7 +254,7 @@ impl App {
     /// (Re)start filtering from the current subject, author and date
     /// constraints. When none is active, drop any running job and fall back to
     /// the unfiltered stream.
-    pub fn apply_filter<W: Write>(&mut self, out: &mut W) -> Result<()> {
+    fn apply_filter<W: Write>(&mut self, out: &mut W) -> Result<()> {
         self.current_page = Page::default();
         self.selected = 0;
 
@@ -352,7 +352,7 @@ impl App {
             .is_some())
     }
 
-    pub fn open_selected(&mut self) -> Result<()> {
+    fn open_selected(&mut self) -> Result<()> {
         let Some(text) = self
             .current_page
             .mails
@@ -424,7 +424,7 @@ impl App {
     }
 
     /// Dispatch to the per-view renderer based on `self.view`.
-    pub fn render<W: Write>(&self, out: &mut W) -> Result<()> {
+    fn render<W: Write>(&self, out: &mut W) -> Result<()> {
         match &self.view {
             View::Loading(msg) => self.render_loading(out, msg),
             View::List => self.render_list(out),
@@ -433,7 +433,7 @@ impl App {
         }
     }
 
-    pub fn render_loading<W: Write>(&self, out: &mut W, message: &str) -> Result<()> {
+    fn render_loading<W: Write>(&self, out: &mut W, message: &str) -> Result<()> {
         let epoch_label = self.epoch_label();
         let page_label = self.page_label();
         ui::draw_loading(
@@ -469,7 +469,7 @@ impl App {
         )
     }
 
-    pub fn render_list<W: Write>(&self, out: &mut W) -> Result<()> {
+    fn render_list<W: Write>(&self, out: &mut W) -> Result<()> {
         let epoch_label = self.epoch_label();
         let page_label = self.page_label();
         let empty_message: Vec<String> = if self.current_page.is_empty() {
@@ -500,7 +500,7 @@ impl App {
         )
     }
 
-    pub fn render_detail<W: Write>(&self, out: &mut W) -> Result<()> {
+    fn render_detail<W: Write>(&self, out: &mut W) -> Result<()> {
         let epoch_label = self.epoch_label();
         let page_label = self.page_label();
         ui::draw_detail(
@@ -513,7 +513,7 @@ impl App {
         )
     }
 
-    pub fn render_help<W: Write>(&self, out: &mut W) -> Result<()> {
+    fn render_help<W: Write>(&self, out: &mut W) -> Result<()> {
         let epoch_label = self.epoch_label();
         let page_label = self.page_label();
         ui::draw_help(
@@ -581,7 +581,7 @@ impl App {
         Ok(())
     }
 
-    pub fn run_loop<W: Write>(&mut self, out: &mut W) -> Result<()> {
+    fn run_loop<W: Write>(&mut self, out: &mut W) -> Result<()> {
         loop {
             if self.poll_source(out)? {
                 self.render(out)?;
