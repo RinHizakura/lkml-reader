@@ -768,7 +768,7 @@ impl App {
                 _ => {}
             },
             View::Help => self.view = View::List,
-            View::Loading(_) => {}
+            View::Loading(_) => self.view = View::List,
         }
         Ok(false)
     }
