@@ -75,6 +75,20 @@ fn page_size_for_terminal() -> usize {
     (rows as usize).saturating_sub(3).max(10)
 }
 
+/// Expand a leading `~`/`~/…` to `$HOME`, like a shell would. `git` is spawned
+/// directly (no shell), so the prompt has to do this itself or the tilde reaches
+/// git verbatim and fails.
+fn expand_tilde(path: &str) -> String {
+    let rest = path
+        .strip_prefix("~/")
+        .or_else(|| (path == "~").then_some(""));
+    match (rest, std::env::var("HOME")) {
+        (Some(""), Ok(home)) => home,
+        (Some(rest), Ok(home)) => format!("{home}/{rest}"),
+        _ => path.to_string(),
+    }
+}
+
 impl App {
     pub fn new(list_name: String) -> Result<Self> {
         let source = MailSource::Stream(StreamSource::new(list_name.clone(), Vec::new()));
@@ -378,8 +392,16 @@ impl App {
         let Some(answer) = self.prompt_text(&label)? else {
             return Ok(());
         };
-        if !answer.trim().is_empty() {
-            self.repo_path = answer.trim().to_string();
+        let answer = answer.trim();
+        let target = if answer.is_empty() {
+            self.repo_path.clone()
+        } else {
+            expand_tilde(answer)
+        };
+        // Adopt the prompted path as the session default only once it proves to
+        // be a real repo.
+        if patch::is_git_repo(&target) {
+            self.repo_path = target.clone();
         }
 
         disable_raw_mode()?;
@@ -389,7 +411,7 @@ impl App {
             self.list_name
         );
         let result = thread::patch_series(&self.list_name, &mail)
-            .and_then(|series| patch::apply(&self.repo_path, &series));
+            .and_then(|series| patch::apply(&target, &series));
         if let Err(e) = result {
             println!("\nNot applied: {e}");
         }
@@ -735,9 +757,11 @@ impl App {
                 }
                 KeyCode::Char('r') => self.reply_selected(out)?,
                 KeyCode::Char('p') => self.apply_patch(out)?,
-                KeyCode::Down => self.detail_scroll += 1,
+                KeyCode::Down => self.detail_scroll = self.detail_scroll.saturating_add(1),
                 KeyCode::Up => self.detail_scroll = self.detail_scroll.saturating_sub(1),
-                KeyCode::PageDown | KeyCode::Char(' ') => self.detail_scroll += 20,
+                KeyCode::PageDown | KeyCode::Char(' ') => {
+                    self.detail_scroll = self.detail_scroll.saturating_add(20)
+                }
                 KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(20),
                 KeyCode::Home | KeyCode::Char('g') => self.detail_scroll = 0,
                 KeyCode::End | KeyCode::Char('G') => self.detail_scroll = usize::MAX,

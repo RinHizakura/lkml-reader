@@ -8,10 +8,35 @@
 
 use anyhow::{bail, Context, Result};
 use std::io::{BufRead, Write};
+use std::path::PathBuf;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 
 use lkml_core::mail::Mail;
+
+/// A scratch directory that deletes itself on drop.
+struct ScratchDir {
+    path: PathBuf,
+}
+
+impl ScratchDir {
+    fn new() -> Result<Self> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = env::temp_dir().join(format!("lkml-patch-{}-{nanos}", std::process::id()));
+        fs::create_dir(&path).context("creating the temp patch dir")?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.path).ok();
+    }
+}
 
 /// Write `patches` out and `git am` them in `repo`. Prints progress to the
 /// plain terminal (the caller must have left the TUI first) and asks before
@@ -21,11 +46,7 @@ pub fn apply(repo: &str, patches: &[Mail]) -> Result<()> {
     if patches.is_empty() {
         bail!("no patch mails found in this thread");
     }
-    let git_dir = Command::new("git")
-        .args(["-C", repo, "rev-parse", "--git-dir"])
-        .output()
-        .context("running git rev-parse")?;
-    if !git_dir.status.success() {
+    if !is_git_repo(repo) {
         bail!("not a git repository: {repo}");
     }
 
@@ -52,11 +73,10 @@ pub fn apply(repo: &str, patches: &[Mail]) -> Result<()> {
 
     // One file per mail: `git am` mailsplits an mbox on "From " lines, and a
     // patch that adds such a line would split in the wrong place.
-    let dir = env::temp_dir().join(format!("lkml-patch-{}", std::process::id()));
-    fs::create_dir_all(&dir).context("creating the temp patch dir")?;
+    let dir = ScratchDir::new()?;
     let mut files = Vec::new();
     for (i, mail) in patches.iter().enumerate() {
-        let path = dir.join(format!("{:04}.patch", i + 1));
+        let path = dir.path.join(format!("{:04}.patch", i + 1));
         fs::write(&path, &mail.raw).context("writing a patch file")?;
         files.push(path);
     }
@@ -66,12 +86,19 @@ pub fn apply(repo: &str, patches: &[Mail]) -> Result<()> {
         .args(["-C", repo, "am"])
         .args(&files)
         .status();
-    fs::remove_dir_all(&dir).ok();
 
     if !status.context("running git am")?.success() {
         bail!("git am failed; the tree is mid-apply (git -C {repo} am --abort to undo)");
     }
     Ok(())
+}
+
+pub fn is_git_repo(repo: &str) -> bool {
+    Command::new("git")
+        .args(["-C", repo, "rev-parse", "--git-dir"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn confirm(prompt: &str) -> Result<bool> {
