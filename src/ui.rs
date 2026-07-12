@@ -68,7 +68,7 @@ pub fn draw_list<W: Write>(out: &mut W, view: &ListView) -> Result<()> {
     draw_list_body(out, view, cols, bottom)?;
     draw_hotkeys(
         out,
-        "↑/↓ select  ←/→ page  Enter view  r reply  / subject  a author  d date  u update  ? help  q quit",
+        "↑/↓ select  ←/→ page  Enter view  r reply  p apply  / subject  a author  d date  u update  ? help  q quit",
         cols,
         rows,
     )?;
@@ -84,7 +84,7 @@ pub fn draw_detail<W: Write>(out: &mut W, view: &DetailView) -> Result<()> {
     draw_detail_body(out, view.text, view.scroll, cols, bottom)?;
     draw_hotkeys(
         out,
-        "↑/↓/PgUp/PgDn scroll  g/G top/bottom  r reply  Esc/q back",
+        "↑/↓/PgUp/PgDn scroll  g/G top/bottom  r reply  p apply  Esc/q back",
         cols,
         rows,
     )?;
@@ -246,7 +246,7 @@ fn queue_list_row<W: Write>(
     };
     let line = format!(
         "{prefix}{author:<author_w$} {subject}",
-        author = truncate(&mail.author(), author_w),
+        author = truncate(&mail.author, author_w),
         author_w = author_w,
     );
     let y = top + row as u16;
@@ -347,6 +347,7 @@ fn draw_help_body<W: Write>(out: &mut W, cols: u16, bottom: u16) -> Result<()> {
         "  ←          previous page",
         "  Enter      open selected mail",
         "  r          reply to selected mail ($EDITOR, then git send-email)",
+        "  p          apply the selected mail's patch series to a git tree (git am)",
         "  /          set subject filter (scans in the background; pages open as matches arrive)",
         "  a          set author filter (substring of the From header: name or address)",
         "  d          set date filter (today | yesterday | YYYY/MM/DD HH:MM to YYYY/MM/DD HH:MM)",
@@ -355,7 +356,7 @@ fn draw_help_body<W: Write>(out: &mut W, cols: u16, bottom: u16) -> Result<()> {
         "  Detail view:",
         "    ↑/↓/PgUp/PgDn scroll   Space = page down",
         "    g / G    jump to top / bottom",
-        "    r        reply   Esc / q  back to list",
+        "    r        reply   p  apply patch series   Esc / q  back to list",
         "",
         "Press any key to return.",
     ];

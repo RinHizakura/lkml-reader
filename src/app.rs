@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 
 use lkml_core::archive;
 use lkml_core::filter::{DateFilter, Filter, NameFilter};
+use lkml_core::thread;
 
+use crate::patch;
 use crate::reply;
 use crate::source::{FilteredSource, MailSource, Page, SourceStatus, StreamSource};
 use crate::ui;
@@ -57,6 +59,10 @@ pub struct App {
     detail_text: String,
     detail_scroll: usize,
 
+    /// The tree `git am` applies to, remembered across applies so the prompt
+    /// only has to be answered once per session. Starts at the cwd.
+    repo_path: String,
+
     /// Marquee scroll position for the currently selected row's title. Advances
     /// once per tick while sitting on a long-title row so the user can read
     /// past the column's right edge.
@@ -88,6 +94,9 @@ impl App {
             view: View::Loading("Starting…".to_string()),
             detail_text: String::new(),
             detail_scroll: 0,
+            repo_path: std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
             selected_title_scroll: 0,
             scroll_last_tick: Instant::now(),
         })
@@ -349,6 +358,47 @@ impl App {
         Ok(())
     }
 
+    /// Prompt for the target repo, then apply the selected mail's whole patch
+    /// series with `git am`.
+    ///
+    /// The apply drops out of the TUI: finding the series takes a second,
+    /// `git am` is chatty, and a failure needs to be read before the TUI paints
+    /// over it.
+    fn apply_patch<W: Write>(&mut self, out: &mut W) -> Result<()> {
+        let Some(mail) = self.current_page.mails.get(self.selected).cloned() else {
+            return Ok(());
+        };
+        if mail.patch_nums.is_none() {
+            self.handle_prompt::<_, ()>("Not a patch mail. Press any key.", |_, _| {
+                PromptAction::Cancel
+            })?;
+            return Ok(());
+        }
+        let label = format!("Apply series to git repo [{}]: ", self.repo_path);
+        let Some(answer) = self.prompt_text(&label)? else {
+            return Ok(());
+        };
+        if !answer.trim().is_empty() {
+            self.repo_path = answer.trim().to_string();
+        }
+
+        disable_raw_mode()?;
+        execute!(out, LeaveAlternateScreen)?;
+        println!(
+            "Finding the rest of the series in the {} mirror…",
+            self.list_name
+        );
+        let result = thread::patch_series(&self.list_name, &mail)
+            .and_then(|series| patch::apply(&self.repo_path, &series));
+        if let Err(e) = result {
+            println!("\nNot applied: {e}");
+        }
+        patch::pause()?;
+        enable_raw_mode()?;
+        execute!(out, EnterAlternateScreen)?;
+        Ok(())
+    }
+
     /// Build per-view structs from current state and dispatch to ui::draw_*.
     /// Dispatch to the per-view renderer based on `self.view`.
     pub fn render<W: Write>(&self, out: &mut W) -> Result<()> {
@@ -569,6 +619,26 @@ impl App {
         }
     }
 
+    /// Prompt for a line of text on the bottom bar with the usual editing keys:
+    /// Enter accepts, Esc cancels (→ `None`), Backspace deletes, and any
+    /// printable non-control character is appended. The shared shape behind the
+    /// filter prompts and the patch-repo prompt.
+    fn prompt_text(&self, label: &str) -> Result<Option<String>> {
+        self.handle_prompt(label, |k, input| match k.code {
+            KeyCode::Enter => PromptAction::Accept(input.clone()),
+            KeyCode::Esc => PromptAction::Cancel,
+            KeyCode::Backspace => {
+                input.pop();
+                PromptAction::Continue
+            }
+            KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+                input.push(c);
+                PromptAction::Continue
+            }
+            _ => PromptAction::Continue,
+        })
+    }
+
     fn handle_key<W: Write>(&mut self, out: &mut W, key: KeyEvent) -> Result<bool> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
             return Ok(true);
@@ -598,24 +668,13 @@ impl App {
                     let _ = self.open_selected();
                 }
                 KeyCode::Char('r') => self.reply_selected(out)?,
+                KeyCode::Char('p') => self.apply_patch(out)?,
                 KeyCode::Char('/') => {
                     let label = format!(
                         "Filter (subject substring, empty=clear) [{}]: ",
                         self.subject_filter
                     );
-                    if let Some(s) = self.handle_prompt(&label, |k, input| match k.code {
-                        KeyCode::Enter => PromptAction::Accept(input.clone()),
-                        KeyCode::Esc => PromptAction::Cancel,
-                        KeyCode::Backspace => {
-                            input.pop();
-                            PromptAction::Continue
-                        }
-                        KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
-                            input.push(c);
-                            PromptAction::Continue
-                        }
-                        _ => PromptAction::Continue,
-                    })? {
+                    if let Some(s) = self.prompt_text(&label)? {
                         self.subject_filter.set(&s);
                         let _ = self.apply_filter(out);
                     }
@@ -625,19 +684,7 @@ impl App {
                         "Filter (author substring, empty=clear) [{}]: ",
                         self.author_filter
                     );
-                    if let Some(s) = self.handle_prompt(&label, |k, input| match k.code {
-                        KeyCode::Enter => PromptAction::Accept(input.clone()),
-                        KeyCode::Esc => PromptAction::Cancel,
-                        KeyCode::Backspace => {
-                            input.pop();
-                            PromptAction::Continue
-                        }
-                        KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
-                            input.push(c);
-                            PromptAction::Continue
-                        }
-                        _ => PromptAction::Continue,
-                    })? {
+                    if let Some(s) = self.prompt_text(&label)? {
                         self.author_filter.set(&s);
                         let _ = self.apply_filter(out);
                     }
@@ -647,19 +694,7 @@ impl App {
                         "Filter date (today | yesterday | YYYY/MM/DD HH:MM to YYYY/MM/DD HH:MM, empty=clear) [{}]: ",
                         self.date_filter
                     );
-                    if let Some(s) = self.handle_prompt(&label, |k, input| match k.code {
-                        KeyCode::Enter => PromptAction::Accept(input.clone()),
-                        KeyCode::Esc => PromptAction::Cancel,
-                        KeyCode::Backspace => {
-                            input.pop();
-                            PromptAction::Continue
-                        }
-                        KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
-                            input.push(c);
-                            PromptAction::Continue
-                        }
-                        _ => PromptAction::Continue,
-                    })? {
+                    if let Some(s) = self.prompt_text(&label)? {
                         match self.date_filter.set(&s) {
                             Ok(()) => {
                                 let _ = self.apply_filter(out);
@@ -699,6 +734,7 @@ impl App {
                     self.view = View::List;
                 }
                 KeyCode::Char('r') => self.reply_selected(out)?,
+                KeyCode::Char('p') => self.apply_patch(out)?,
                 KeyCode::Down => self.detail_scroll += 1,
                 KeyCode::Up => self.detail_scroll = self.detail_scroll.saturating_sub(1),
                 KeyCode::PageDown | KeyCode::Char(' ') => self.detail_scroll += 20,
