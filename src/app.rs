@@ -8,7 +8,7 @@ use crossterm::{
         disable_raw_mode, enable_raw_mode, size, EnterAlternateScreen, LeaveAlternateScreen,
     },
 };
-use std::io::{stdout, Write};
+use std::io::{stdin, stdout, BufRead, Write};
 use std::time::{Duration, Instant};
 
 use lkml_core::archive;
@@ -87,6 +87,31 @@ fn expand_tilde(path: &str) -> String {
         (Some(rest), Ok(home)) => format!("{home}/{rest}"),
         _ => path.to_string(),
     }
+}
+
+/// Wait for the user to press Enter before the TUI paints back over whatever a
+/// child process left on the plain terminal.
+fn pause() {
+    print!("\nPress Enter to return to the reader.");
+    let _ = stdout().flush();
+    let _ = stdin().lock().read_line(&mut String::new());
+}
+
+/// Run `f` with the TUI suspended so a child process (`$EDITOR`, `git`) owns the
+/// terminal, wait for acknowledgement, then restore the alternate screen —
+/// however `f` returned.
+fn suspended<W, F>(out: &mut W, f: F) -> Result<()>
+where
+    W: Write,
+    F: FnOnce() -> Result<()>,
+{
+    disable_raw_mode()?;
+    execute!(out, LeaveAlternateScreen)?;
+    let outcome = f();
+    pause();
+    enable_raw_mode()?;
+    execute!(out, EnterAlternateScreen)?;
+    outcome
 }
 
 impl App {
@@ -348,8 +373,8 @@ impl App {
         Ok(())
     }
 
-    /// Reply to the selected mail: drop out of the TUI so `$EDITOR` and
-    /// `git send-email` own the terminal, then restore it either way.
+    /// Reply to the selected mail, with `$EDITOR` and `git send-email` owning
+    /// the terminal while it runs.
     fn reply_selected<W: Write>(&mut self, out: &mut W) -> Result<()> {
         let Some(draft) = self
             .current_page
@@ -359,25 +384,14 @@ impl App {
         else {
             return Ok(());
         };
-
-        disable_raw_mode()?;
-        execute!(out, LeaveAlternateScreen)?;
-        let result = reply::compose_and_send(&draft);
-        enable_raw_mode()?;
-        execute!(out, EnterAlternateScreen)?;
-
-        if let Err(e) = result {
+        if let Err(e) = suspended(out, || reply::compose_and_send(&draft)) {
             self.view = View::Loading(format!("Reply not sent: {e}"));
         }
         Ok(())
     }
 
     /// Prompt for the target repo, then apply the selected mail's whole patch
-    /// series with `git am`.
-    ///
-    /// The apply drops out of the TUI: finding the series takes a second,
-    /// `git am` is chatty, and a failure needs to be read before the TUI paints
-    /// over it.
+    /// series with `git am`, with git owning the terminal while it runs.
     fn apply_patch<W: Write>(&mut self, out: &mut W) -> Result<()> {
         let Some(mail) = self.current_page.mails.get(self.selected).cloned() else {
             return Ok(());
@@ -404,24 +418,17 @@ impl App {
             self.repo_path = target.clone();
         }
 
-        disable_raw_mode()?;
-        execute!(out, LeaveAlternateScreen)?;
-        println!(
-            "Finding the rest of the series in the {} mirror…",
-            self.list_name
-        );
-        let result = thread::patch_series(&self.list_name, &mail)
-            .and_then(|series| patch::apply(&target, &series));
-        if let Err(e) = result {
-            println!("\nNot applied: {e}");
+        let list = self.list_name.clone();
+        let outcome = suspended(out, || {
+            println!("Finding the rest of the series in the {list} mirror…");
+            thread::patch_series(&list, &mail).and_then(|series| patch::apply(&target, &series))
+        });
+        if let Err(e) = outcome {
+            self.view = View::Loading(format!("Not applied: {e}"));
         }
-        patch::pause()?;
-        enable_raw_mode()?;
-        execute!(out, EnterAlternateScreen)?;
         Ok(())
     }
 
-    /// Build per-view structs from current state and dispatch to ui::draw_*.
     /// Dispatch to the per-view renderer based on `self.view`.
     pub fn render<W: Write>(&self, out: &mut W) -> Result<()> {
         match &self.view {

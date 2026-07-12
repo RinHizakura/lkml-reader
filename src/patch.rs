@@ -108,11 +108,3 @@ fn confirm(prompt: &str) -> Result<bool> {
     std::io::stdin().lock().read_line(&mut answer)?;
     Ok(matches!(answer.trim(), "y" | "Y"))
 }
-
-/// Hold the plain terminal until the user has read whatever was printed there.
-pub fn pause() -> Result<()> {
-    print!("\nPress Enter to return to the reader.");
-    std::io::stdout().flush()?;
-    std::io::stdin().lock().read_line(&mut String::new())?;
-    Ok(())
-}
