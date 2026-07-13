@@ -30,14 +30,22 @@ pub struct LoadingView<'a> {
 
 pub struct ListView<'a> {
     pub header: HeaderInfo<'a>,
-    pub page_idx: usize,
-    pub page_size: usize,
+    /// Offset of the page's first mail in the stream; row numbering starts here.
+    pub offset: usize,
     pub mails: &'a [Mail],
+    /// Per row: draw it indented under the series head above it.
+    pub indent: &'a [bool],
     pub selected: usize,
+    /// First row shown. A page that grew to hold a whole patch series can be
+    /// taller than the window, so the list scrolls within the page.
+    pub scroll: usize,
     /// Tick counter driving the marquee scroll on the selected row's title.
     pub selected_scroll: usize,
     pub empty_message: &'a [String],
 }
+
+/// What a patch hangs under its series head by.
+const INDENT: &str = "  ↳ ";
 
 pub struct DetailView<'a> {
     pub header: HeaderInfo<'a>,
@@ -168,12 +176,7 @@ fn draw_centered<W: Write>(out: &mut W, msg: &str, cols: u16, bottom: u16) -> Re
     Ok(())
 }
 
-fn draw_list_body<W: Write>(
-    out: &mut W,
-    view: &ListView,
-    cols: u16,
-    bottom: u16,
-) -> Result<()> {
+fn draw_list_body<W: Write>(out: &mut W, view: &ListView, cols: u16, bottom: u16) -> Result<()> {
     let top = 1u16;
     if bottom <= top {
         return Ok(());
@@ -191,33 +194,34 @@ fn draw_list_body<W: Write>(
         return Ok(());
     }
 
-    let total = view.mails.len();
-    let row_count = visible.min(total);
-    for row in 0..row_count {
-        queue_list_row(out, view, row, cols, top)?;
+    for (row, idx) in (view.scroll..view.mails.len()).take(visible).enumerate() {
+        queue_list_row(out, view, idx, cols, top + row as u16)?;
     }
     Ok(())
 }
 
-/// Render a single row at its on-screen position, applying the marquee scroll
-/// when this is the selected row. Extracted so the per-tick marquee update can
-/// redraw just one line instead of repainting the whole screen.
+/// Render the row for `idx` at screen line `y`, applying the marquee scroll when
+/// it is the selected row. Extracted so the per-tick marquee update can redraw
+/// just one line instead of repainting the whole screen.
 fn queue_list_row<W: Write>(
     out: &mut W,
     view: &ListView,
-    row: usize,
+    idx: usize,
     cols: u16,
-    top: u16,
+    y: u16,
 ) -> Result<()> {
-    let total = view.mails.len();
-    let page_offset = view.page_idx * view.page_size;
-    let idx_w = (page_offset + total).to_string().len().max(3);
+    let idx_w = (view.offset + view.mails.len()).to_string().len().max(3);
     let date_w = 16;
     let author_w = 24;
 
-    let mail = &view.mails[row];
-    let selected = row == view.selected;
-    let abs_idx = page_offset + row + 1;
+    let mail = &view.mails[idx];
+    let selected = idx == view.selected;
+    let indent = if view.indent.get(idx) == Some(&true) {
+        INDENT
+    } else {
+        ""
+    };
+    let abs_idx = view.offset + idx + 1;
     let prefix = format!(
         " [{:0idx_w$}] {:date_w$}  ",
         abs_idx,
@@ -225,7 +229,8 @@ fn queue_list_row<W: Write>(
         idx_w = idx_w,
         date_w = date_w
     );
-    let subject_w = (cols as usize).saturating_sub(prefix.len() + author_w + 1);
+    let subject_w =
+        (cols as usize).saturating_sub(prefix.len() + author_w + 1 + indent.chars().count());
     let title_chars = mail.subject.chars().count();
     let subject: String = if selected && title_chars > subject_w {
         // Ring the title with a tab-width gap so it scrolls continuously:
@@ -245,11 +250,10 @@ fn queue_list_row<W: Write>(
         mail.subject.chars().take(subject_w).collect()
     };
     let line = format!(
-        "{prefix}{author:<author_w$} {subject}",
+        "{prefix}{author:<author_w$} {indent}{subject}",
         author = truncate(&mail.author, author_w),
         author_w = author_w,
     );
-    let y = top + row as u16;
     if selected {
         queue!(
             out,
@@ -276,11 +280,12 @@ pub fn redraw_selected_row<W: Write>(out: &mut W, view: &ListView) -> Result<()>
     let (cols, rows) = size()?;
     let bottom = content_bottom(rows);
     let top = 1u16;
-    if bottom <= top || view.mails.is_empty() || view.selected >= view.mails.len() {
+    if bottom <= top || view.selected >= view.mails.len() || view.selected < view.scroll {
         return Ok(());
     }
     queue!(out, Hide)?;
-    queue_list_row(out, view, view.selected, cols, top)?;
+    let y = top + (view.selected - view.scroll) as u16;
+    queue_list_row(out, view, view.selected, cols, y)?;
     out.flush()?;
     Ok(())
 }
@@ -403,17 +408,16 @@ fn truncate(s: &str, w: usize) -> String {
     s.chars().take(w).collect()
 }
 
-/// Width of the subject column in the list view, given the terminal width and
-/// the number of mails on the current page. Mirrors the prefix/author layout
-/// in `draw_list_body` so callers (e.g. the marquee tick) can decide whether
-/// scrolling is needed without re-rendering.
-pub fn subject_column_width(cols: u16, page_idx: usize, page_size: usize, page_count: usize) -> usize {
-    let page_offset = page_idx * page_size;
-    let idx_w = (page_offset + page_count).to_string().len().max(3);
+/// Width of the subject column for a row of the current page, given the terminal
+/// width, where the page starts and how many mails it holds. Mirrors the
+/// prefix/author layout in `queue_list_row` so callers (e.g. the marquee tick)
+/// can decide whether scrolling is needed without re-rendering.
+pub fn subject_column_width(cols: u16, offset: usize, page_count: usize, indented: bool) -> usize {
+    let idx_w = (offset + page_count).to_string().len().max(3);
     let date_w = 16;
     let author_w = 24;
     // prefix is " [<idx>] <date>  ": 2 + idx_w + 2 + date_w + 2 chars.
     let prefix_len = 6 + idx_w + date_w;
-    (cols as usize).saturating_sub(prefix_len + author_w + 1)
+    let indent_w = if indented { INDENT.chars().count() } else { 0 };
+    (cols as usize).saturating_sub(prefix_len + author_w + 1 + indent_w)
 }
-
