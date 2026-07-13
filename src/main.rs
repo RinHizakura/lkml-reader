@@ -27,5 +27,5 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    app::App::new(args.list)?.run()
+    app::App::new(args.list).run()
 }

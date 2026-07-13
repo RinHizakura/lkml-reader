@@ -40,7 +40,8 @@ pub struct App {
     date_filter: DateFilter,
 
     available_epochs: Vec<u32>,
-    epoch_cursor: usize,
+    /// The newest epoch: the one bootstrapped and refreshed by `u`. Paging walks
+    /// every epoch, so this only names the mirror the reader keeps current.
     cur_epoch: u32,
     /// Whether the current epoch's mirror has been prepared; gates the
     /// "no local mirror" empty-state message. The archive module owns the
@@ -78,9 +79,11 @@ pub struct App {
     scroll_last_tick: Instant,
 }
 
+/// Rows a page fills: the whole window bar the header and the hotkey line. Also
+/// the height the list scrolls by when a page outgrows the window.
 fn page_size_for_terminal() -> usize {
     let (_, rows) = size().unwrap_or((80, 24));
-    (rows as usize).saturating_sub(3).max(10)
+    (rows as usize).saturating_sub(2).max(10)
 }
 
 /// Expand a leading `~`/`~/…` to `$HOME`, like a shell would. `git` is spawned
@@ -123,15 +126,14 @@ where
 }
 
 impl App {
-    pub fn new(list_name: String) -> Result<Self> {
+    pub fn new(list_name: String) -> Self {
         let source = MailSource::Stream(StreamSource::new(list_name.clone(), Vec::new()));
-        Ok(Self {
+        Self {
             list_name,
             subject_filter: NameFilter::subject(),
             author_filter: NameFilter::author(),
             date_filter: DateFilter::new(),
             available_epochs: Vec::new(),
-            epoch_cursor: 0,
             cur_epoch: 0,
             repo_ready: false,
             source,
@@ -148,12 +150,7 @@ impl App {
                 .unwrap_or_default(),
             selected_title_scroll: 0,
             scroll_last_tick: Instant::now(),
-        })
-    }
-
-    fn update_cur_epoch(&mut self, epoch: usize) {
-        self.epoch_cursor = epoch;
-        self.cur_epoch = self.available_epochs[self.epoch_cursor];
+        }
     }
 
     fn reset_title_scroll(&mut self) {
@@ -200,8 +197,8 @@ impl App {
         // A network failure here is non-fatal: fall through to whatever mirror
         // is already cached locally.
         if let Ok(epochs) = archive::list_epochs(&self.list_name) {
+            self.cur_epoch = epochs.last().copied().unwrap_or_default();
             self.available_epochs = epochs;
-            self.update_cur_epoch(self.available_epochs.len() - 1);
         }
         Ok(())
     }
@@ -486,7 +483,6 @@ impl App {
         }
         let epoch_label = self.epoch_label();
         let page_label = self.page_label();
-        let empty: Vec<String> = Vec::new();
         ui::redraw_selected_row(
             out,
             &ui::ListView {
@@ -497,7 +493,7 @@ impl App {
                 selected: self.selected,
                 scroll: self.list_scroll,
                 selected_scroll: self.selected_title_scroll,
-                empty_message: &empty,
+                empty_message: &[],
             },
         )
     }
@@ -570,15 +566,9 @@ impl App {
     }
 
     fn epoch_label(&self) -> String {
-        if self.available_epochs.is_empty() {
-            "-".to_string()
-        } else {
-            format!(
-                "{} ({}/{})",
-                self.cur_epoch,
-                self.epoch_cursor + 1,
-                self.available_epochs.len()
-            )
+        match self.available_epochs.len() {
+            0 => "-".to_string(),
+            n => format!("{} (newest of {n})", self.cur_epoch),
         }
     }
 

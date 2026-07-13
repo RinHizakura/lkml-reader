@@ -46,6 +46,9 @@ pub struct ListView<'a> {
 
 /// What a patch hangs under its series head by.
 const INDENT: &str = "  ↳ ";
+/// List row layout: `%Y/%m/%d %H:%M` fits in 16, a display name in 24.
+const DATE_W: usize = 16;
+const AUTHOR_W: usize = 24;
 
 pub struct DetailView<'a> {
     pub header: HeaderInfo<'a>,
@@ -210,23 +213,17 @@ fn queue_list_row<W: Write>(
     cols: u16,
     y: u16,
 ) -> Result<()> {
-    let idx_w = (view.offset + view.mails.len()).to_string().len().max(3);
-    let date_w = 16;
-    let author_w = 24;
-
     let mail = &view.mails[idx];
     let selected = idx == view.selected;
     let indent = if view.indent[idx] { INDENT } else { "" };
-    let abs_idx = view.offset + idx + 1;
+    let page_count = view.mails.len();
     let prefix = format!(
-        " [{:0idx_w$}] {:date_w$}  ",
-        abs_idx,
+        " [{:0idx_w$}] {:DATE_W$}  ",
+        view.offset + idx + 1,
         mail.date_str(),
-        idx_w = idx_w,
-        date_w = date_w
+        idx_w = index_width(view.offset, page_count),
     );
-    let subject_w =
-        (cols as usize).saturating_sub(prefix.len() + author_w + 1 + indent.chars().count());
+    let subject_w = subject_column_width(cols, view.offset, page_count, view.indent[idx]);
     let title_chars = mail.subject.chars().count();
     let subject: String = if selected && title_chars > subject_w {
         // Ring the title with a tab-width gap so it scrolls continuously:
@@ -246,9 +243,8 @@ fn queue_list_row<W: Write>(
         mail.subject.chars().take(subject_w).collect()
     };
     let line = format!(
-        "{prefix}{author:<author_w$} {indent}{subject}",
-        author = truncate(&mail.author, author_w),
-        author_w = author_w,
+        "{prefix}{author:<AUTHOR_W$} {indent}{subject}",
+        author = truncate(&mail.author, AUTHOR_W),
     );
     if selected {
         queue!(
@@ -404,16 +400,17 @@ fn truncate(s: &str, w: usize) -> String {
     s.chars().take(w).collect()
 }
 
-/// Width of the subject column for a row of the current page, given the terminal
-/// width, where the page starts and how many mails it holds. Mirrors the
-/// prefix/author layout in `queue_list_row` so callers (e.g. the marquee tick)
-/// can decide whether scrolling is needed without re-rendering.
+/// Width of the row number column: wide enough for the last mail on the page.
+fn index_width(offset: usize, page_count: usize) -> usize {
+    (offset + page_count).to_string().len().max(3)
+}
+
+/// Width of the subject column for a row of the current page. The one place the
+/// row layout is worked out: `queue_list_row` renders against it, and the marquee
+/// tick asks it whether a title overflows without re-rendering.
 pub fn subject_column_width(cols: u16, offset: usize, page_count: usize, indented: bool) -> usize {
-    let idx_w = (offset + page_count).to_string().len().max(3);
-    let date_w = 16;
-    let author_w = 24;
-    // prefix is " [<idx>] <date>  ": 2 + idx_w + 2 + date_w + 2 chars.
-    let prefix_len = 6 + idx_w + date_w;
+    // prefix is " [<idx>] <date>  ": 2 + idx_w + 2 + DATE_W + 2 chars.
+    let prefix_w = 6 + index_width(offset, page_count) + DATE_W;
     let indent_w = if indented { INDENT.chars().count() } else { 0 };
-    (cols as usize).saturating_sub(prefix_len + author_w + 1 + indent_w)
+    (cols as usize).saturating_sub(prefix_w + AUTHOR_W + 1 + indent_w)
 }
