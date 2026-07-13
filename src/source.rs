@@ -53,7 +53,7 @@ impl Page {
     /// A page of the unfiltered stream: patch series pulled into blocks and
     /// marked for indentation.
     pub fn grouped(mails: Vec<Mail>, offset: usize) -> Self {
-        let (mails, indent) = group_series(mails);
+        let (mails, indent) = group_series(&mails);
         Self {
             mails,
             indent,
@@ -85,7 +85,7 @@ impl Page {
 /// Reorder `mails` so every patch series forms one block — cover letter (or
 /// lowest-numbered patch) first, the rest ascending — sitting where the series'
 /// newest mail was, and flag the members that belong under the head.
-fn group_series(mails: Vec<Mail>) -> (Vec<Mail>, Vec<bool>) {
+fn group_series(mails: &[Mail]) -> (Vec<Mail>, Vec<bool>) {
     let tags: Vec<Option<SeriesTag>> = mails.iter().map(thread::series_tag).collect();
     let mut series: HashMap<&SeriesTag, Vec<usize>> = HashMap::new();
     for (i, tag) in tags.iter().enumerate() {
@@ -97,79 +97,59 @@ fn group_series(mails: Vec<Mail>) -> (Vec<Mail>, Vec<bool>) {
         members.sort_by_key(|&i| mails[i].patch_tag.map_or(0, |t| t.number));
     }
 
-    let mut out = Vec::with_capacity(tags.len());
-    let mut indent = Vec::with_capacity(tags.len());
-    let mut pool: Vec<Option<Mail>> = mails.into_iter().map(Some).collect();
-    for i in 0..pool.len() {
-        if pool[i].is_none() {
+    let mut out = Vec::with_capacity(mails.len());
+    let mut indent = Vec::with_capacity(mails.len());
+    let mut placed = vec![false; mails.len()];
+    for i in 0..mails.len() {
+        if placed[i] {
             continue;
         }
-        match tags[i].as_ref().and_then(|tag| series.get(tag)) {
-            // A lone member is left where it is: nothing to indent it under.
-            Some(members) if members.len() > 1 => {
-                for (nth, &j) in members.iter().enumerate() {
-                    if let Some(mail) = pool[j].take() {
-                        out.push(mail);
-                        indent.push(nth > 0);
-                    }
-                }
-            }
-            _ => {
-                out.extend(pool[i].take());
-                indent.push(false);
-            }
+        // The whole series lands here, where its newest mail sat. A lone member
+        // stays put: there is nothing to indent it under.
+        let block = match tags[i].as_ref().and_then(|tag| series.get(tag)) {
+            Some(members) if members.len() > 1 => members.as_slice(),
+            _ => std::slice::from_ref(&i),
+        };
+        for (nth, &j) in block.iter().enumerate() {
+            placed[j] = true;
+            out.push(mails[j].clone());
+            indent.push(nth > 0);
         }
     }
     (out, indent)
 }
 
-/// Has the walk collected everything the page needs? Up to `page_size` it never
-/// has. At that point the page either ends cleanly and is done, or ends
-/// mid-series, and `wanted` picks up the chase for the patches still to come —
-/// bounded by [`SERIES_EXTEND_MAX`], since a series only partly in the archive
-/// would otherwise drag the whole epoch in.
-fn page_done(
-    mails: &[Mail],
-    page_size: usize,
-    wanted: &mut Option<(SeriesTag, HashSet<u32>)>,
-) -> bool {
-    match wanted {
-        Some((_, missing)) => missing.is_empty() || mails.len() >= page_size + SERIES_EXTEND_MAX,
-        None if mails.len() >= page_size => {
-            *wanted = cut_at_tail(mails);
-            wanted.is_none()
-        }
-        None => false,
+/// Has the walk collected everything the page needs? Short of `page_size`, never.
+/// At that point the page either ends cleanly and is done, or ends mid-series and
+/// `chasing` takes up the rest of that series — bounded by [`SERIES_EXTEND_MAX`],
+/// since a series only partly in the archive would never complete.
+fn page_done(mails: &[Mail], page_size: usize, chasing: &mut Option<SeriesTag>) -> bool {
+    if mails.len() < page_size {
+        return false;
     }
-}
-
-/// Cross a just-fetched mail off the patches the chase is waiting for.
-fn cross_off(wanted: &mut Option<(SeriesTag, HashSet<u32>)>, mail: &Mail) {
-    let Some((tag, missing)) = wanted else { return };
-    if thread::series_tag(mail).as_ref() == Some(tag) {
-        if let Some(patch) = mail.patch_tag {
-            missing.remove(&patch.number);
+    match chasing {
+        Some(tag) => is_whole(mails, tag) || mails.len() >= page_size + SERIES_EXTEND_MAX,
+        // Only the mail at the boundary counts. A series that looks half-present
+        // further up the page is one whose siblings live somewhere else entirely
+        // — an old patch resent, a stray `2/9` — and chasing every one of those
+        // drags in mails that cut yet more series, page after page.
+        None => {
+            *chasing = thread::series_tag(mails.last().expect("page_size > 0"))
+                .filter(|tag| !is_whole(mails, tag));
+            chasing.is_none()
         }
     }
 }
 
-/// The series the page's last mail belongs to and the patches of it still
-/// missing, or `None` when the page does not end mid-series.
-///
-/// Only the mail at the boundary counts. A series that looks half-present
-/// further up the page is a mail whose siblings live somewhere else entirely —
-/// an old patch resent, a stray `2/9` — and chasing every one of those drags in
-/// mails that cut yet more series, page after page.
-fn cut_at_tail(mails: &[Mail]) -> Option<(SeriesTag, HashSet<u32>)> {
-    let tag = thread::series_tag(mails.last()?)?;
+/// Is every patch of `tag` on the page? The 0/m cover letter is optional;
+/// 1/m..m/m are not.
+fn is_whole(mails: &[Mail], tag: &SeriesTag) -> bool {
     let seen: HashSet<u32> = mails
         .iter()
-        .filter(|mail| thread::series_tag(mail).as_ref() == Some(&tag))
+        .filter(|mail| thread::series_tag(mail).as_ref() == Some(tag))
         .filter_map(|mail| mail.patch_tag.map(|patch| patch.number))
         .collect();
-    // The 0/m cover letter is optional; 1/m..m/m are not.
-    let missing: HashSet<u32> = (1..=tag.total).filter(|n| !seen.contains(n)).collect();
-    (!missing.is_empty()).then_some((tag, missing))
+    (1..=tag.total).all(|n| seen.contains(&n))
 }
 
 /// The unfiltered mail stream: every mail across all epochs, newest-first.
@@ -203,10 +183,8 @@ impl StreamSource {
 
         let mut mails: Vec<Mail> = Vec::new();
         let mut to_skip = offset;
-        // The series the full page ended in the middle of, and the patches of it
-        // still to come. `None` until the page is full; empty once the series is
-        // whole and the page is done.
-        let mut wanted: Option<(SeriesTag, HashSet<u32>)> = None;
+        // The series the page ended in the middle of, once it is otherwise full.
+        let mut chasing: Option<SeriesTag> = None;
         let mut eidx = self.available_epochs.len();
         'epochs: while eidx > 0 {
             eidx -= 1;
@@ -234,12 +212,11 @@ impl StreamSource {
                 continue;
             }
             for i in to_skip..n {
-                if page_done(&mails, page_size, &mut wanted) {
+                if page_done(&mails, page_size, &mut chasing) {
                     break 'epochs;
                 }
                 let commit = self.epoch_commits[&epoch][i].clone();
                 if let Ok(mail) = mail::fetch(&self.list_name, epoch, &commit) {
-                    cross_off(&mut wanted, &mail);
                     mails.push(mail);
                 }
             }

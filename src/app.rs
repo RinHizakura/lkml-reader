@@ -175,7 +175,7 @@ impl App {
             cols,
             self.current_page.offset,
             self.current_page.mails.len(),
-            self.current_page.indent.get(self.selected) == Some(&true),
+            self.current_page.indent[self.selected],
         );
         if mail.subject.chars().count() <= subject_w {
             if self.selected_title_scroll != 0 {

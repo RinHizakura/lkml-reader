@@ -216,11 +216,7 @@ fn queue_list_row<W: Write>(
 
     let mail = &view.mails[idx];
     let selected = idx == view.selected;
-    let indent = if view.indent.get(idx) == Some(&true) {
-        INDENT
-    } else {
-        ""
-    };
+    let indent = if view.indent[idx] { INDENT } else { "" };
     let abs_idx = view.offset + idx + 1;
     let prefix = format!(
         " [{:0idx_w$}] {:date_w$}  ",
