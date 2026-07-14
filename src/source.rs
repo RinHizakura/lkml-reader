@@ -11,8 +11,6 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread as stdthread;
 
-use anyhow::Result;
-
 use lkml_core::archive;
 use lkml_core::filter::{DateFilter, Filter, NameFilter};
 use lkml_core::mail::{self, Mail};
@@ -176,9 +174,9 @@ impl StreamSource {
     /// page still cuts a patch series in half. Returns `NeedsClone` for the
     /// first epoch that must be cloned to make progress, or `Exhausted` past
     /// the end of the stream.
-    pub fn status(&mut self, offset: usize, page_size: usize) -> Result<SourceStatus> {
+    pub fn status(&mut self, offset: usize, page_size: usize) -> SourceStatus {
         if self.available_epochs.is_empty() {
-            return Ok(SourceStatus::Exhausted);
+            return SourceStatus::Exhausted;
         }
 
         let mut mails: Vec<Mail> = Vec::new();
@@ -197,7 +195,7 @@ impl StreamSource {
                     break;
                 }
                 if !archive::repo_exists(&self.list_name, epoch) {
-                    return Ok(SourceStatus::NeedsClone(epoch));
+                    return SourceStatus::NeedsClone(epoch);
                 }
                 match archive::list_all_commits(&self.list_name, epoch) {
                     Ok(commits) => {
@@ -224,9 +222,9 @@ impl StreamSource {
         }
 
         if mails.is_empty() {
-            return Ok(SourceStatus::Exhausted);
+            return SourceStatus::Exhausted;
         }
-        Ok(SourceStatus::Ready(Page::grouped(mails, offset)))
+        SourceStatus::Ready(Page::grouped(mails, offset))
     }
 }
 
@@ -429,10 +427,10 @@ impl MailSource {
     }
 
     /// Ask whether the page starting at `offset` can be served yet.
-    pub fn status(&mut self, offset: usize, page_size: usize) -> Result<SourceStatus> {
+    pub fn status(&mut self, offset: usize, page_size: usize) -> SourceStatus {
         match self {
             MailSource::Stream(s) => s.status(offset, page_size),
-            MailSource::Filtered(f) => Ok(f.status(offset, page_size)),
+            MailSource::Filtered(f) => f.status(offset, page_size),
         }
     }
 

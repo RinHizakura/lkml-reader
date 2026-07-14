@@ -330,7 +330,7 @@ impl App {
     fn resolve_page<W: Write>(&mut self, target: usize, out: &mut W) -> Result<()> {
         self.pending_page = Some(target);
         loop {
-            match self.source.status(target, self.page_size)? {
+            match self.source.status(target, self.page_size) {
                 SourceStatus::Ready(page) => {
                     self.current_page = page;
                     self.selected = 0;
