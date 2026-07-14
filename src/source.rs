@@ -237,7 +237,7 @@ impl StreamSource {
                 // Still append one at a time: the page ends the moment the series
                 // it was cutting completes, and only a per-mail check finds that
                 // boundary. Whatever of the batch is past it goes unused.
-                for mail in mail::fetch_many(&self.list_name, epoch, batch)
+                for mail in mail::fetch(&self.list_name, epoch, batch)
                     .unwrap_or_default()
                     .into_iter()
                 {
@@ -434,7 +434,7 @@ fn spawn_worker(
                 if cancel_worker.load(Ordering::Relaxed) {
                     return;
                 }
-                let Ok(mails) = mail::fetch_many(&list, epoch, chunk) else {
+                let Ok(mails) = mail::fetch(&list, epoch, chunk) else {
                     continue;
                 };
                 for mail in mails {
