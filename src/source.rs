@@ -21,6 +21,12 @@ use lkml_core::thread::{self, SeriesTag};
 /// archive and so would never complete.
 const SERIES_EXTEND_MAX: usize = 64;
 
+/// How many mails to read ahead while chasing the tail of a series that the page
+/// cut. The page can end on any one of them, so most of a batch may go unused —
+/// but reading a batch costs about what reading a single mail used to, so a
+/// modest look-ahead is still far cheaper than one git process per mail.
+const CHASE_READAHEAD: usize = 16;
+
 /// One page of mails, with each patch series pulled together into a block —
 /// cover letter first, its patches indented under it.
 ///
@@ -209,16 +215,38 @@ impl StreamSource {
                 to_skip -= n;
                 continue;
             }
-            for i in to_skip..n {
+            let mut i = to_skip;
+            to_skip = 0;
+            while i < n {
                 if page_done(&mails, page_size, &mut chasing) {
                     break 'epochs;
                 }
-                let commit = self.epoch_commits[&epoch][i].clone();
-                if let Ok(mail) = mail::fetch(&self.list_name, epoch, &commit) {
+                // Read ahead to the next point the page could possibly end: the
+                // whole shortfall while the page is still short, or a look-ahead
+                // while chasing the tail of a series. Reading a batch costs about
+                // one mail's worth of git, so over-reading the tail is far cheaper
+                // than the process it would otherwise take to read each mail.
+                let want = match page_size.checked_sub(mails.len()) {
+                    Some(0) | None => CHASE_READAHEAD,
+                    Some(short) => short,
+                };
+                let end = (i + want).min(n);
+                let batch = &self.epoch_commits[&epoch][i..end];
+                i = end;
+
+                // Still append one at a time: the page ends the moment the series
+                // it was cutting completes, and only a per-mail check finds that
+                // boundary. Whatever of the batch is past it goes unused.
+                for mail in mail::fetch_many(&self.list_name, epoch, batch)
+                    .unwrap_or_default()
+                    .into_iter()
+                {
+                    if page_done(&mails, page_size, &mut chasing) {
+                        break 'epochs;
+                    }
                     mails.push(mail);
                 }
             }
-            to_skip = 0;
         }
 
         if mails.is_empty() {
@@ -364,6 +392,9 @@ impl Drop for FilteredSource {
     }
 }
 
+/// How many matching mails one git process reads for the filter scan.
+const FILTER_CHUNK: usize = 64;
+
 /// Spawn a worker that scans `epochs` (newest-first) and sends every mail that
 /// satisfies all filters. Subject and author are pushed down into `git log`,
 /// which narrows a whole epoch in about a second; only the surviving commits
@@ -395,11 +426,18 @@ fn spawn_worker(
             ) else {
                 continue;
             };
-            for commit in commits {
+            // In chunks, so one git process serves many matches — a broad filter
+            // matches thousands, and a process each is most of the wait. Small
+            // enough that results still stream in as they are found, and that
+            // cancelling lands within a chunk.
+            for chunk in commits.chunks(FILTER_CHUNK) {
                 if cancel_worker.load(Ordering::Relaxed) {
                     return;
                 }
-                if let Ok(mail) = mail::fetch(&list, epoch, &commit) {
+                let Ok(mails) = mail::fetch_many(&list, epoch, chunk) else {
+                    continue;
+                };
+                for mail in mails {
                     if date.matches(&mail) && tx.send(mail).is_err() {
                         return;
                     }
