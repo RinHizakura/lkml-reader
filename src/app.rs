@@ -230,18 +230,28 @@ impl App {
         Ok(())
     }
 
-    /// Reload from scratch: drop to a fresh unfiltered stream, reset to page 0.
-    fn refresh<W: Write>(&mut self, out: &mut W) -> Result<()> {
-        self.source = MailSource::Stream(StreamSource::new(
-            self.list_name.clone(),
-            self.available_epochs.clone(),
-        ));
+    /// Read mails from `source` from now on, starting over at page 0. Dropping
+    /// the source it replaces cancels any worker that one owned.
+    fn read_from<W: Write>(&mut self, source: MailSource, out: &mut W) -> Result<()> {
+        self.source = source;
         self.current_page = Page::default();
         self.page_offsets = vec![0];
         self.selected = 0;
+        self.resolve_page(0, out)
+    }
+
+    /// The unfiltered stream over every epoch we know of.
+    fn stream(&self) -> MailSource {
+        MailSource::Stream(StreamSource::new(
+            self.list_name.clone(),
+            self.available_epochs.clone(),
+        ))
+    }
+
+    /// Reload from scratch: drop to a fresh unfiltered stream, reset to page 0.
+    fn refresh<W: Write>(&mut self, out: &mut W) -> Result<()> {
         self.repo_ready = true;
-        self.resolve_page(0, out)?;
-        Ok(())
+        self.read_from(self.stream(), out)
     }
 
     /// Step to the page after the current one. Where it starts depends on how
@@ -284,21 +294,10 @@ impl App {
     /// constraints. When none is active, drop any running job and fall back to
     /// the unfiltered stream.
     fn apply_filter<W: Write>(&mut self, out: &mut W) -> Result<()> {
-        self.current_page = Page::default();
-        self.page_offsets = vec![0];
-        self.selected = 0;
-
-        // Reassigning self.source drops the previous one, cancelling its worker.
         if !self.any_filter_active() {
-            self.source = MailSource::Stream(StreamSource::new(
-                self.list_name.clone(),
-                self.available_epochs.clone(),
-            ));
-            self.resolve_page(0, out)?;
-            return Ok(());
+            return self.read_from(self.stream(), out);
         }
-
-        self.source = MailSource::Filtered(FilteredSource::start(
+        let scan = MailSource::Filtered(FilteredSource::start(
             self.list_name.clone(),
             self.subject_filter.clone(),
             self.author_filter.clone(),
@@ -307,7 +306,7 @@ impl App {
         ));
         // The scan has nothing yet, so this leaves the source's own loading
         // screen up; the run loop serves the page once matches arrive.
-        self.resolve_page(0, out)
+        self.read_from(scan, out)
     }
 
     /// Advance any background work and, if a page is still pending, try again to
