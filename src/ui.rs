@@ -40,6 +40,8 @@ pub struct ListView<'a> {
     pub empty_message: &'a [String],
 }
 
+/// First row below the header bar: where every view's content starts.
+const CONTENT_TOP: u16 = 1;
 /// What a patch hangs under its series head by.
 const INDENT: &str = "  ↳ ";
 /// List row layout: `%Y/%m/%d %H:%M` fits in 16, a display name in 24.
@@ -47,15 +49,20 @@ const DATE_W: usize = 16;
 const AUTHOR_W: usize = 24;
 
 /// Paint a whole screen: header bar, `body` in the space between, hotkey bar.
-/// `body` is handed the width and the first row past the content area.
+/// `body` is handed the width and the first row past the content area, and is
+/// skipped outright on a window too short to have one — so no body has to guard
+/// against that itself.
 fn draw_frame<W: Write, F>(out: &mut W, header: &HeaderInfo, hint: &str, body: F) -> Result<()>
 where
     F: FnOnce(&mut W, u16, u16) -> Result<()>,
 {
     let (cols, rows) = size()?;
+    let bottom = rows.saturating_sub(1);
     queue!(out, Hide, Clear(ClearType::All))?;
     draw_header(out, header, cols)?;
-    body(out, cols, rows.saturating_sub(1))?;
+    if bottom > CONTENT_TOP {
+        body(out, cols, bottom)?;
+    }
     draw_hotkeys(out, hint, cols, rows)?;
     out.flush()?;
     Ok(())
@@ -134,11 +141,7 @@ fn draw_header<W: Write>(out: &mut W, h: &HeaderInfo, cols: u16) -> Result<()> {
 }
 
 fn draw_centered<W: Write>(out: &mut W, msg: &str, cols: u16, bottom: u16) -> Result<()> {
-    let top = 1u16;
-    if bottom <= top {
-        return Ok(());
-    }
-    let y = top + (bottom - top) / 2;
+    let y = CONTENT_TOP + (bottom - CONTENT_TOP) / 2;
     let x = ((cols as usize).saturating_sub(msg.chars().count()) / 2) as u16;
     queue!(
         out,
@@ -151,15 +154,11 @@ fn draw_centered<W: Write>(out: &mut W, msg: &str, cols: u16, bottom: u16) -> Re
 }
 
 fn draw_list_body<W: Write>(out: &mut W, view: &ListView, cols: u16, bottom: u16) -> Result<()> {
-    let top = 1u16;
-    if bottom <= top {
-        return Ok(());
-    }
-    let visible = (bottom - top) as usize;
+    let visible = (bottom - CONTENT_TOP) as usize;
 
     if view.mails.is_empty() {
         for (i, line) in view.empty_message.iter().enumerate() {
-            let y = top + 1 + i as u16;
+            let y = CONTENT_TOP + 1 + i as u16;
             if y >= bottom {
                 break;
             }
@@ -169,7 +168,7 @@ fn draw_list_body<W: Write>(out: &mut W, view: &ListView, cols: u16, bottom: u16
     }
 
     for (row, idx) in (view.scroll..view.mails.len()).take(visible).enumerate() {
-        queue_list_row(out, view, idx, cols, top + row as u16)?;
+        queue_list_row(out, view, idx, cols, CONTENT_TOP + row as u16)?;
     }
     Ok(())
 }
@@ -217,22 +216,19 @@ fn queue_list_row<W: Write>(
         "{prefix}{author:<AUTHOR_W$} {indent}{subject}",
         author = truncate(&mail.author, AUTHOR_W),
     );
+    queue!(out, MoveTo(0, y))?;
     if selected {
         queue!(
             out,
-            MoveTo(0, y),
             SetBackgroundColor(Color::Blue),
-            SetForegroundColor(Color::White),
-            Print(pad_or_truncate(&line, cols as usize)),
-            ResetColor,
-        )?;
-    } else {
-        queue!(
-            out,
-            MoveTo(0, y),
-            Print(pad_or_truncate(&line, cols as usize))
+            SetForegroundColor(Color::White)
         )?;
     }
+    queue!(
+        out,
+        Print(pad_or_truncate(&line, cols as usize)),
+        ResetColor
+    )?;
     Ok(())
 }
 
@@ -242,12 +238,11 @@ fn queue_list_row<W: Write>(
 pub fn redraw_selected_row<W: Write>(out: &mut W, view: &ListView) -> Result<()> {
     let (cols, rows) = size()?;
     let bottom = rows.saturating_sub(1);
-    let top = 1u16;
-    if bottom <= top || view.selected >= view.mails.len() || view.selected < view.scroll {
+    if bottom <= CONTENT_TOP || view.selected >= view.mails.len() || view.selected < view.scroll {
         return Ok(());
     }
     queue!(out, Hide)?;
-    let y = top + (view.selected - view.scroll) as u16;
+    let y = CONTENT_TOP + (view.selected - view.scroll) as u16;
     queue_list_row(out, view, view.selected, cols, y)?;
     out.flush()?;
     Ok(())
@@ -260,11 +255,7 @@ fn draw_detail_body<W: Write>(
     cols: u16,
     bottom: u16,
 ) -> Result<()> {
-    let top = 1u16;
-    if bottom <= top {
-        return Ok(());
-    }
-    let visible = (bottom - top) as usize;
+    let visible = (bottom - CONTENT_TOP) as usize;
     let lines: Vec<&str> = text.lines().collect();
     let max_scroll = lines.len().saturating_sub(visible);
     let scroll = scroll.min(max_scroll);
@@ -273,7 +264,7 @@ fn draw_detail_body<W: Write>(
         if idx >= lines.len() {
             break;
         }
-        let y = top + row as u16;
+        let y = CONTENT_TOP + row as u16;
         let line = truncate(lines[idx], cols as usize);
         queue!(out, MoveTo(0, y))?;
         if let Some(color) = diff_line_color(&line) {
