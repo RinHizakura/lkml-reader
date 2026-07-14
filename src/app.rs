@@ -49,7 +49,7 @@ pub struct App {
     repo_ready: bool,
 
     /// Where mails come from: the full unfiltered stream or an active filtered
-    /// scan. Owns any per-source paging state (caches, pending page).
+    /// scan. Owns its own caches; the app drives which page it serves.
     source: MailSource,
 
     page_size: usize,
@@ -59,6 +59,10 @@ pub struct App {
     /// window — so a page is found by its offset, and this is what makes
     /// stepping back to the previous one possible.
     page_offsets: Vec<usize>,
+    /// Where the page we are trying to show starts, while the source is still
+    /// working on it. `None` once it has been served (or given up on); only a
+    /// filtered scan ever keeps one pending across run-loop ticks.
+    pending_page: Option<usize>,
     selected: usize,
     /// First row of the current page shown on screen. Non-zero only when the
     /// page is taller than the window.
@@ -140,6 +144,7 @@ impl App {
             page_size: page_size_for_terminal(),
             current_page: Page::default(),
             page_offsets: vec![0],
+            pending_page: None,
             selected: 0,
             list_scroll: 0,
             view: View::Loading("Starting…".to_string()),
@@ -252,7 +257,6 @@ impl App {
         if self.page_offsets.last() < Some(&target) {
             self.page_offsets.push(target);
         }
-        self.source.request_offset(target);
         self.resolve_page(target, out)
     }
 
@@ -266,9 +270,7 @@ impl App {
         else {
             return Ok(());
         };
-        let target = self.page_offsets[pos - 1];
-        self.source.request_offset(target);
-        self.resolve_page(target, out)
+        self.resolve_page(self.page_offsets[pos - 1], out)
     }
 
     /// Whether any filter constrains the stream.
@@ -303,18 +305,16 @@ impl App {
             self.date_filter.clone(),
             &self.available_epochs,
         ));
-        self.view = View::Loading(format!(
-            "Filtering subject='{}' author='{}' date='{}'…",
-            self.subject_filter, self.author_filter, self.date_filter
-        ));
-        Ok(())
+        // The scan has nothing yet, so this leaves the source's own loading
+        // screen up; the run loop serves the page once matches arrive.
+        self.resolve_page(0, out)
     }
 
-    /// Advance any background work and, if a page is pending, try to serve it.
-    /// Returns true when the view changed and a redraw is warranted.
+    /// Advance any background work and, if a page is still pending, try again to
+    /// serve it. Returns true when the view changed and a redraw is warranted.
     fn poll_source<W: Write>(&mut self, out: &mut W) -> Result<bool> {
         self.source.poll();
-        match self.source.pending_offset() {
+        match self.pending_page {
             Some(target) => {
                 self.resolve_page(target, out)?;
                 Ok(true)
@@ -325,49 +325,48 @@ impl App {
 
     /// Drive the active source toward serving the page starting at `target`:
     /// show it when ready, keep a loading screen up while work is pending, or
-    /// prompt to clone the next epoch when the source is blocked.
+    /// prompt to clone the next epoch when the source is blocked. The page stays
+    /// pending only while the source is still working on it.
     fn resolve_page<W: Write>(&mut self, target: usize, out: &mut W) -> Result<()> {
+        self.pending_page = Some(target);
         loop {
             match self.source.status(target, self.page_size)? {
                 SourceStatus::Ready(page) => {
                     self.current_page = page;
                     self.selected = 0;
                     self.list_scroll = 0;
-                    self.view = View::List;
-                    self.source.clear_pending();
                     self.reset_title_scroll();
-                    return Ok(());
+                    break;
                 }
                 SourceStatus::Loading(message) => {
                     self.view = View::Loading(message);
                     return Ok(());
                 }
-                SourceStatus::Exhausted => {
-                    self.source.clear_pending();
-                    self.view = View::List;
-                    return Ok(());
-                }
+                SourceStatus::Exhausted => break,
                 SourceStatus::NeedsClone(epoch) => {
-                    if self.prompt_clone(epoch)? {
-                        self.view = View::Loading(format!(
-                            "Cloning {} epoch {} (this may take a while)…",
-                            self.list_name, epoch
-                        ));
-                        self.render(out)?;
-                        if archive::ensure_epoch(&self.list_name, epoch).is_err() {
-                            self.source.clear_pending();
-                            self.view = View::List;
-                            return Ok(());
+                    if !self.prompt_clone(epoch)? {
+                        // The stream cannot get past a missing epoch; the filter
+                        // drops it and tries the next uncloned one.
+                        if self.source.decline_clone(epoch) {
+                            continue;
                         }
-                        self.source.on_cloned(epoch);
-                    } else if !self.source.decline_clone(epoch) {
-                        self.source.clear_pending();
-                        self.view = View::List;
-                        return Ok(());
+                        break;
                     }
+                    self.view = View::Loading(format!(
+                        "Cloning {} epoch {} (this may take a while)…",
+                        self.list_name, epoch
+                    ));
+                    self.render(out)?;
+                    if archive::ensure_epoch(&self.list_name, epoch).is_err() {
+                        break;
+                    }
+                    self.source.on_cloned(epoch);
                 }
             }
         }
+        self.pending_page = None;
+        self.view = View::List;
+        Ok(())
     }
 
     /// Prompt the user to confirm cloning `epoch`. Returns whether they agreed.
@@ -603,12 +602,10 @@ impl App {
 
         self.view = View::Loading("Loading mails…".to_string());
         self.render(out)?;
-        let _ = self.refresh(out);
-
-        self.view = View::List;
-        self.render(out)?;
-
-        Ok(())
+        // The unfiltered stream resolves synchronously, so this lands on the
+        // list view (or an empty one) — nothing stays pending.
+        self.refresh(out)?;
+        self.render(out)
     }
 
     fn run_loop<W: Write>(&mut self, out: &mut W) -> Result<()> {
@@ -637,7 +634,6 @@ impl App {
                         self.page_size = page_size_for_terminal();
                         let offset = self.current_page.offset;
                         self.page_offsets.retain(|&s| s <= offset);
-                        self.source.request_offset(offset);
                         let _ = self.resolve_page(offset, out);
                         self.render(out)?;
                     }

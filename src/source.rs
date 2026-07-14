@@ -245,8 +245,6 @@ pub struct FilteredSource {
     done: bool,
     /// Epochs not present locally, newest-first, awaiting on-demand clone.
     uncloned: Vec<u32>,
-    /// Start offset of the page awaited while the worker collects enough matches.
-    pending_offset: Option<usize>,
 }
 
 impl FilteredSource {
@@ -288,20 +286,7 @@ impl FilteredSource {
             results: Vec::new(),
             done: false,
             uncloned,
-            pending_offset: Some(0),
         }
-    }
-
-    pub fn pending_offset(&self) -> Option<usize> {
-        self.pending_offset
-    }
-
-    pub fn request_offset(&mut self, offset: usize) {
-        self.pending_offset = Some(offset);
-    }
-
-    pub fn clear_pending(&mut self) {
-        self.pending_offset = None;
     }
 
     /// Drain the worker's channel into `results`.
@@ -440,29 +425,6 @@ impl MailSource {
     pub fn poll(&mut self) {
         if let MailSource::Filtered(f) = self {
             f.poll();
-        }
-    }
-
-    /// The offset of the page awaited across run-loop ticks. The stream
-    /// resolves synchronously, so it is never pending.
-    pub fn pending_offset(&self) -> Option<usize> {
-        match self {
-            MailSource::Stream(_) => None,
-            MailSource::Filtered(f) => f.pending_offset(),
-        }
-    }
-
-    /// Mark the page at `offset` as the one to serve. No-op for the stream.
-    pub fn request_offset(&mut self, offset: usize) {
-        if let MailSource::Filtered(f) = self {
-            f.request_offset(offset);
-        }
-    }
-
-    /// Clear the awaited page. No-op for the stream.
-    pub fn clear_pending(&mut self) {
-        if let MailSource::Filtered(f) = self {
-            f.clear_pending();
         }
     }
 
