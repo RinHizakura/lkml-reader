@@ -286,21 +286,14 @@ fn draw_detail_body<W: Write>(
 }
 
 /// Pick a foreground color for unified-diff lines so patches embedded in mails
-/// render with the familiar red/green/cyan scheme. `+++`/`---` file headers
-/// match their hunk side (green/red); `@@` hunk markers are cyan.
+/// render with the familiar red/green/cyan scheme. The `+++`/`---` file headers
+/// fall out green/red like the hunk side they name; `@@` markers are cyan.
 fn diff_line_color(line: &str) -> Option<Color> {
-    if line.starts_with("+++") {
-        Some(Color::Green)
-    } else if line.starts_with("---") {
-        Some(Color::Red)
-    } else if line.starts_with("@@") {
-        Some(Color::Cyan)
-    } else if line.starts_with('+') {
-        Some(Color::Green)
-    } else if line.starts_with('-') {
-        Some(Color::Red)
-    } else {
-        None
+    match line.chars().next()? {
+        '+' => Some(Color::Green),
+        '-' => Some(Color::Red),
+        '@' if line.starts_with("@@") => Some(Color::Cyan),
+        _ => None,
     }
 }
 
@@ -355,16 +348,10 @@ fn draw_hotkeys<W: Write>(out: &mut W, hint: &str, cols: u16, rows: u16) -> Resu
     Ok(())
 }
 
+/// Cut `s` to `w` columns, padding with spaces when it falls short — `{:<w$}`
+/// counts chars, so this stays right for multi-byte subjects.
 fn pad_or_truncate(s: &str, w: usize) -> String {
-    let truncated: String = s.chars().take(w).collect();
-    let len = truncated.chars().count();
-    if len >= w {
-        truncated
-    } else {
-        let mut out = truncated;
-        out.extend(std::iter::repeat_n(' ', w - len));
-        out
-    }
+    format!("{:<w$}", truncate(s, w))
 }
 
 fn truncate(s: &str, w: usize) -> String {
