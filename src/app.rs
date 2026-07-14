@@ -453,24 +453,14 @@ impl App {
 
     /// Dispatch to the per-view renderer based on `self.view`.
     fn render<W: Write>(&self, out: &mut W) -> Result<()> {
+        let (epoch_label, page_label) = (self.epoch_label(), self.page_label());
+        let header = self.header_info(&epoch_label, &page_label);
         match &self.view {
-            View::Loading(msg) => self.render_loading(out, msg),
-            View::List => self.render_list(out),
-            View::Detail => self.render_detail(out),
-            View::Help => self.render_help(out),
+            View::Loading(msg) => ui::draw_loading(out, &header, msg),
+            View::List => ui::draw_list(out, &self.list_view(header, &self.empty_message())),
+            View::Detail => ui::draw_detail(out, &header, &self.detail_text, self.detail_scroll),
+            View::Help => ui::draw_help(out, &header),
         }
-    }
-
-    fn render_loading<W: Write>(&self, out: &mut W, message: &str) -> Result<()> {
-        let epoch_label = self.epoch_label();
-        let page_label = self.page_label();
-        ui::draw_loading(
-            out,
-            &ui::LoadingView {
-                header: self.header_info(&epoch_label, &page_label),
-                message,
-            },
-        )
     }
 
     /// Redraw only the selected row, used for marquee ticks. Avoids the full
@@ -480,77 +470,43 @@ impl App {
         if !matches!(self.view, View::List) || self.current_page.is_empty() {
             return Ok(());
         }
-        let epoch_label = self.epoch_label();
-        let page_label = self.page_label();
-        ui::redraw_selected_row(
-            out,
-            &ui::ListView {
-                header: self.header_info(&epoch_label, &page_label),
-                offset: self.current_page.offset,
-                mails: &self.current_page.mails,
-                indent: &self.current_page.indent,
-                selected: self.selected,
-                scroll: self.list_scroll,
-                selected_scroll: self.selected_title_scroll,
-                empty_message: &[],
-            },
-        )
+        let (epoch_label, page_label) = (self.epoch_label(), self.page_label());
+        let header = self.header_info(&epoch_label, &page_label);
+        ui::redraw_selected_row(out, &self.list_view(header, &[]))
     }
 
-    fn render_list<W: Write>(&self, out: &mut W) -> Result<()> {
-        let epoch_label = self.epoch_label();
-        let page_label = self.page_label();
-        let empty_message: Vec<String> = if self.current_page.is_empty() {
-            if !self.repo_ready {
-                vec![
-                    format!("No local mirror for list '{}'.", self.list_name),
-                    "The TUI clones the latest epoch automatically — check your network and try again.".to_string(),
-                ]
-            } else if !self.any_filter_active() {
-                vec!["No mails on this page.".to_string()]
-            } else {
-                vec!["No mails match filter. Press '/', 'a' or 'd' to change it.".to_string()]
-            }
-        } else {
+    /// What to say instead of rows when the page has none.
+    fn empty_message(&self) -> Vec<String> {
+        if !self.current_page.is_empty() {
             Vec::new()
-        };
-        ui::draw_list(
-            out,
-            &ui::ListView {
-                header: self.header_info(&epoch_label, &page_label),
-                offset: self.current_page.offset,
-                mails: &self.current_page.mails,
-                indent: &self.current_page.indent,
-                selected: self.selected,
-                scroll: self.list_scroll,
-                selected_scroll: self.selected_title_scroll,
-                empty_message: &empty_message,
-            },
-        )
+        } else if !self.repo_ready {
+            vec![
+                format!("No local mirror for list '{}'.", self.list_name),
+                "The TUI clones the latest epoch automatically — check your network and try again."
+                    .to_string(),
+            ]
+        } else if !self.any_filter_active() {
+            vec!["No mails on this page.".to_string()]
+        } else {
+            vec!["No mails match filter. Press '/', 'a' or 'd' to change it.".to_string()]
+        }
     }
 
-    fn render_detail<W: Write>(&self, out: &mut W) -> Result<()> {
-        let epoch_label = self.epoch_label();
-        let page_label = self.page_label();
-        ui::draw_detail(
-            out,
-            &ui::DetailView {
-                header: self.header_info(&epoch_label, &page_label),
-                text: &self.detail_text,
-                scroll: self.detail_scroll,
-            },
-        )
-    }
-
-    fn render_help<W: Write>(&self, out: &mut W) -> Result<()> {
-        let epoch_label = self.epoch_label();
-        let page_label = self.page_label();
-        ui::draw_help(
-            out,
-            &ui::HelpView {
-                header: self.header_info(&epoch_label, &page_label),
-            },
-        )
+    fn list_view<'a>(
+        &'a self,
+        header: ui::HeaderInfo<'a>,
+        empty_message: &'a [String],
+    ) -> ui::ListView<'a> {
+        ui::ListView {
+            header,
+            offset: self.current_page.offset,
+            mails: &self.current_page.mails,
+            indent: &self.current_page.indent,
+            selected: self.selected,
+            scroll: self.list_scroll,
+            selected_scroll: self.selected_title_scroll,
+            empty_message,
+        }
     }
 
     fn header_info<'a>(&'a self, epoch_label: &'a str, page_label: &'a str) -> ui::HeaderInfo<'a> {

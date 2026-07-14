@@ -14,6 +14,7 @@ use std::io::Write;
 use lkml_core::filter::{DateFilter, NameFilter};
 use lkml_core::mail::Mail;
 
+#[derive(Clone, Copy)]
 pub struct HeaderInfo<'a> {
     pub list_name: &'a str,
     pub epoch_label: &'a str,
@@ -21,11 +22,6 @@ pub struct HeaderInfo<'a> {
     pub subject_filter: &'a NameFilter,
     pub author_filter: &'a NameFilter,
     pub date_filter: &'a DateFilter,
-}
-
-pub struct LoadingView<'a> {
-    pub header: HeaderInfo<'a>,
-    pub message: &'a str,
 }
 
 pub struct ListView<'a> {
@@ -50,57 +46,52 @@ const INDENT: &str = "  ↳ ";
 const DATE_W: usize = 16;
 const AUTHOR_W: usize = 24;
 
-pub struct DetailView<'a> {
-    pub header: HeaderInfo<'a>,
-    pub text: &'a str,
-    pub scroll: usize,
-}
-
-pub struct HelpView<'a> {
-    pub header: HeaderInfo<'a>,
-}
-
-pub fn draw_loading<W: Write>(out: &mut W, view: &LoadingView) -> Result<()> {
+/// Paint a whole screen: header bar, `body` in the space between, hotkey bar.
+/// `body` is handed the width and the first row past the content area.
+fn draw_frame<W: Write, F>(out: &mut W, header: &HeaderInfo, hint: &str, body: F) -> Result<()>
+where
+    F: FnOnce(&mut W, u16, u16) -> Result<()>,
+{
     let (cols, rows) = size()?;
-    let bottom = content_bottom(rows);
-    begin_frame(out)?;
-    draw_header(out, &view.header, cols)?;
-    draw_centered(out, &format!("⏳  {}", view.message), cols, bottom)?;
-    draw_hotkeys(out, "", cols, rows)?;
+    queue!(out, Hide, Clear(ClearType::All))?;
+    draw_header(out, header, cols)?;
+    body(out, cols, rows.saturating_sub(1))?;
+    draw_hotkeys(out, hint, cols, rows)?;
     out.flush()?;
     Ok(())
+}
+
+pub fn draw_loading<W: Write>(out: &mut W, header: &HeaderInfo, message: &str) -> Result<()> {
+    draw_frame(out, header, "", |out, cols, bottom| {
+        draw_centered(out, &format!("⏳  {message}"), cols, bottom)
+    })
 }
 
 pub fn draw_list<W: Write>(out: &mut W, view: &ListView) -> Result<()> {
-    let (cols, rows) = size()?;
-    let bottom = content_bottom(rows);
-    begin_frame(out)?;
-    draw_header(out, &view.header, cols)?;
-    draw_list_body(out, view, cols, bottom)?;
-    draw_hotkeys(
+    draw_frame(
         out,
+        &view.header,
         "↑/↓ select  ←/→ page  Enter view  r reply  p apply  / subject  a author  d date  u update  ? help  q quit",
-        cols,
-        rows,
-    )?;
-    out.flush()?;
-    Ok(())
+        |out, cols, bottom| draw_list_body(out, view, cols, bottom),
+    )
 }
 
-pub fn draw_detail<W: Write>(out: &mut W, view: &DetailView) -> Result<()> {
-    let (cols, rows) = size()?;
-    let bottom = content_bottom(rows);
-    begin_frame(out)?;
-    draw_header(out, &view.header, cols)?;
-    draw_detail_body(out, view.text, view.scroll, cols, bottom)?;
-    draw_hotkeys(
+pub fn draw_detail<W: Write>(
+    out: &mut W,
+    header: &HeaderInfo,
+    text: &str,
+    scroll: usize,
+) -> Result<()> {
+    draw_frame(
         out,
+        header,
         "↑/↓/PgUp/PgDn scroll  g/G top/bottom  r reply  p apply  Esc/q back",
-        cols,
-        rows,
-    )?;
-    out.flush()?;
-    Ok(())
+        |out, cols, bottom| draw_detail_body(out, text, scroll, cols, bottom),
+    )
+}
+
+pub fn draw_help<W: Write>(out: &mut W, header: &HeaderInfo) -> Result<()> {
+    draw_frame(out, header, "press any key to return", draw_help_body)
 }
 
 pub fn redraw_prompt<W: Write>(out: &mut W, label: &str, input: &str, y: u16) -> Result<()> {
@@ -121,26 +112,6 @@ pub fn redraw_prompt<W: Write>(out: &mut W, label: &str, input: &str, y: u16) ->
         Show
     )?;
     out.flush()?;
-    Ok(())
-}
-
-pub fn draw_help<W: Write>(out: &mut W, view: &HelpView) -> Result<()> {
-    let (cols, rows) = size()?;
-    let bottom = content_bottom(rows);
-    begin_frame(out)?;
-    draw_header(out, &view.header, cols)?;
-    draw_help_body(out, cols, bottom)?;
-    draw_hotkeys(out, "press any key to return", cols, rows)?;
-    out.flush()?;
-    Ok(())
-}
-
-fn content_bottom(rows: u16) -> u16 {
-    rows.saturating_sub(1)
-}
-
-fn begin_frame<W: Write>(out: &mut W) -> Result<()> {
-    queue!(out, Hide, Clear(ClearType::All))?;
     Ok(())
 }
 
@@ -270,7 +241,7 @@ fn queue_list_row<W: Write>(
 /// the tick rate).
 pub fn redraw_selected_row<W: Write>(out: &mut W, view: &ListView) -> Result<()> {
     let (cols, rows) = size()?;
-    let bottom = content_bottom(rows);
+    let bottom = rows.saturating_sub(1);
     let top = 1u16;
     if bottom <= top || view.selected >= view.mails.len() || view.selected < view.scroll {
         return Ok(());
