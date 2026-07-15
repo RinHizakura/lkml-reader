@@ -259,15 +259,19 @@ fn draw_detail_body<W: Write>(
     let lines: Vec<&str> = text.lines().collect();
     let max_scroll = lines.len().saturating_sub(visible);
     let scroll = scroll.min(max_scroll);
-    for row in 0..visible {
-        let idx = scroll + row;
-        if idx >= lines.len() {
-            break;
+    // Diff coloring is stateful: a `-`/`+` line is only a diff line inside a
+    // hunk, so track that from the top (not just the visible window) — otherwise
+    // prose bullet lists starting with `-` render as red removals.
+    let mut in_hunk = false;
+    for idx in 0..(scroll + visible).min(lines.len()) {
+        let color = diff_line_color(lines[idx], &mut in_hunk);
+        if idx < scroll {
+            continue;
         }
-        let y = CONTENT_TOP + row as u16;
+        let y = CONTENT_TOP + (idx - scroll) as u16;
         let line = truncate(lines[idx], cols as usize);
         queue!(out, MoveTo(0, y))?;
-        if let Some(color) = diff_line_color(&line) {
+        if let Some(color) = color {
             queue!(out, SetForegroundColor(color), Print(line), ResetColor)?;
         } else {
             queue!(out, Print(line))?;
@@ -277,14 +281,27 @@ fn draw_detail_body<W: Write>(
 }
 
 /// Pick a foreground color for unified-diff lines so patches embedded in mails
-/// render with the familiar red/green/cyan scheme. The `+++`/`---` file headers
-/// fall out green/red like the hunk side they name; `@@` markers are cyan.
-fn diff_line_color(line: &str) -> Option<Color> {
-    match line.chars().next()? {
-        '+' => Some(Color::Green),
-        '-' => Some(Color::Red),
-        '@' if line.starts_with("@@") => Some(Color::Cyan),
-        _ => None,
+/// render with the familiar red/green/cyan scheme. Coloring is gated on being
+/// inside a `@@` hunk so prose (bullet lists starting with `-`, `+N` version
+/// notes) isn't mistaken for a diff. `@@`/`diff --git`/`---`/`+++` headers open
+/// the region; the first line that isn't hunk content closes it.
+fn diff_line_color(line: &str, in_hunk: &mut bool) -> Option<Color> {
+    if line.starts_with("@@") && line[2..].starts_with(|c| c == ' ' || c == '-') {
+        *in_hunk = true;
+        return Some(Color::Cyan);
+    }
+    if line.starts_with("diff --git") || line.starts_with("--- ") || line.starts_with("+++ ") {
+        *in_hunk = true; // file headers precede the first @@ but belong to the patch
+    }
+    match line.chars().next() {
+        Some('+') if *in_hunk => Some(Color::Green),
+        Some('-') if *in_hunk => Some(Color::Red),
+        Some(' ') | Some('\\') if *in_hunk => None, // context / "\ No newline"
+        Some('+') | Some('-') => None,              // stray sign, but header already colored above
+        _ => {
+            *in_hunk = false;
+            None
+        }
     }
 }
 
@@ -362,4 +379,59 @@ pub fn subject_column_width(cols: u16, offset: usize, page_count: usize, indente
     let prefix_w = 6 + index_width(offset, page_count) + DATE_W;
     let indent_w = if indented { INDENT.chars().count() } else { 0 };
     (cols as usize).saturating_sub(prefix_w + AUTHOR_W + 1 + indent_w)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn colors(text: &str) -> Vec<Option<Color>> {
+        let mut in_hunk = false;
+        text.lines()
+            .map(|l| diff_line_color(l, &mut in_hunk))
+            .collect()
+    }
+
+    #[test]
+    fn prose_bullets_are_not_diff() {
+        // The reported bug: bullet lists outside a hunk must stay uncolored.
+        let c = colors("Changes:\n- fixed a thing\n- added another\n+ optional note");
+        assert_eq!(c, vec![None, None, None, None]);
+    }
+
+    #[test]
+    fn real_hunk_colors_signs() {
+        let c = colors("@@ -1,3 +1,3 @@\n context\n-old\n+new");
+        assert_eq!(
+            c,
+            vec![
+                Some(Color::Cyan),
+                None,
+                Some(Color::Red),
+                Some(Color::Green)
+            ]
+        );
+    }
+
+    #[test]
+    fn file_headers_open_the_region() {
+        let c = colors("diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-x\n+y");
+        assert_eq!(
+            c,
+            vec![
+                None,
+                Some(Color::Red),
+                Some(Color::Green),
+                Some(Color::Cyan),
+                Some(Color::Red),
+                Some(Color::Green),
+            ]
+        );
+    }
+
+    #[test]
+    fn prose_after_hunk_closes_it() {
+        let c = colors("@@ -1 +1 @@\n-x\nThen a note:\n- bullet again");
+        assert_eq!(c, vec![Some(Color::Cyan), Some(Color::Red), None, None]);
+    }
 }
