@@ -3,12 +3,8 @@
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
-    execute,
-    terminal::{
-        disable_raw_mode, enable_raw_mode, size, EnterAlternateScreen, LeaveAlternateScreen,
-    },
+    terminal::size,
 };
-use std::io::{stdin, stdout, BufRead, Write};
 use std::time::{Duration, Instant};
 
 use lkml_core::archive;
@@ -18,6 +14,7 @@ use lkml_core::thread;
 use crate::patch;
 use crate::reply;
 use crate::source::{FilteredSource, MailSource, Page, SourceStatus, StreamSource};
+use crate::tui::{PromptAction, Tui};
 use crate::ui;
 
 enum View {
@@ -25,12 +22,6 @@ enum View {
     List,
     Detail,
     Help,
-}
-
-enum PromptAction<R> {
-    Continue,
-    Cancel,
-    Accept(R),
 }
 
 pub struct App {
@@ -104,31 +95,6 @@ fn expand_tilde(path: &str) -> String {
     }
 }
 
-/// Wait for the user to press Enter before the TUI paints back over whatever a
-/// child process left on the plain terminal.
-fn pause() {
-    print!("\nPress Enter to return to the reader.");
-    let _ = stdout().flush();
-    let _ = stdin().lock().read_line(&mut String::new());
-}
-
-/// Run `f` with the TUI suspended so a child process (`$EDITOR`, `git`) owns the
-/// terminal, wait for acknowledgement, then restore the alternate screen —
-/// however `f` returned.
-fn suspended<W, F>(out: &mut W, f: F) -> Result<()>
-where
-    W: Write,
-    F: FnOnce() -> Result<()>,
-{
-    disable_raw_mode()?;
-    execute!(out, LeaveAlternateScreen)?;
-    let outcome = f();
-    pause();
-    enable_raw_mode()?;
-    execute!(out, EnterAlternateScreen)?;
-    outcome
-}
-
 impl App {
     pub fn new(list_name: String) -> Self {
         let source = MailSource::Stream(StreamSource::new(list_name.clone(), Vec::new()));
@@ -195,9 +161,9 @@ impl App {
         true
     }
 
-    fn bootstrap_manifest<W: Write>(&mut self, out: &mut W) -> Result<()> {
+    fn bootstrap_manifest(&mut self, tui: &mut Tui) -> Result<()> {
         self.view = View::Loading(format!("Fetching manifest for '{}'…", self.list_name));
-        self.render(out)?;
+        self.render(tui)?;
 
         // A network failure here is non-fatal: fall through to whatever mirror
         // is already cached locally.
@@ -208,7 +174,7 @@ impl App {
         Ok(())
     }
 
-    fn bootstrap_mirror<W: Write>(&mut self, out: &mut W) -> Result<()> {
+    fn bootstrap_mirror(&mut self, tui: &mut Tui) -> Result<()> {
         let exists = archive::repo_exists(&self.list_name, self.cur_epoch);
         let loading_message = if exists {
             format!(
@@ -222,7 +188,7 @@ impl App {
             )
         };
         self.view = View::Loading(loading_message);
-        self.render(out)?;
+        self.render(tui)?;
 
         // The archive module decides clone-vs-update; `exists` above only picks
         // the right loading message.
@@ -232,12 +198,12 @@ impl App {
 
     /// Read mails from `source` from now on, starting over at page 0. Dropping
     /// the source it replaces cancels any worker that one owned.
-    fn read_from<W: Write>(&mut self, source: MailSource, out: &mut W) -> Result<()> {
+    fn read_from(&mut self, source: MailSource, tui: &mut Tui) -> Result<()> {
         self.source = source;
         self.current_page = Page::default();
         self.page_offsets = vec![0];
         self.selected = 0;
-        self.resolve_page(0, out)
+        self.resolve_page(0, tui)
     }
 
     /// The unfiltered stream over every epoch we know of.
@@ -249,15 +215,15 @@ impl App {
     }
 
     /// Reload from scratch: drop to a fresh unfiltered stream, reset to page 0.
-    fn refresh<W: Write>(&mut self, out: &mut W) -> Result<()> {
+    fn refresh(&mut self, tui: &mut Tui) -> Result<()> {
         self.repo_ready = true;
-        self.read_from(self.stream(), out)
+        self.read_from(self.stream(), tui)
     }
 
     /// Step to the page after the current one. Where it starts depends on how
     /// long this one turned out to be, so the boundary is only known once the
     /// current page has been served — remember it for the way back.
-    fn next_page<W: Write>(&mut self, out: &mut W) -> Result<()> {
+    fn next_page(&mut self, tui: &mut Tui) -> Result<()> {
         if self.current_page.is_empty() {
             return Ok(());
         }
@@ -267,11 +233,11 @@ impl App {
         if self.page_offsets.last() < Some(&target) {
             self.page_offsets.push(target);
         }
-        self.resolve_page(target, out)
+        self.resolve_page(target, tui)
     }
 
     /// Step back to the page before the current one, stopping at the first.
-    fn prev_page<W: Write>(&mut self, out: &mut W) -> Result<()> {
+    fn prev_page(&mut self, tui: &mut Tui) -> Result<()> {
         let Some(pos) = self
             .page_offsets
             .iter()
@@ -280,7 +246,7 @@ impl App {
         else {
             return Ok(());
         };
-        self.resolve_page(self.page_offsets[pos - 1], out)
+        self.resolve_page(self.page_offsets[pos - 1], tui)
     }
 
     /// Whether any filter constrains the stream.
@@ -293,9 +259,9 @@ impl App {
     /// (Re)start filtering from the current subject, author and date
     /// constraints. When none is active, drop any running job and fall back to
     /// the unfiltered stream.
-    fn apply_filter<W: Write>(&mut self, out: &mut W) -> Result<()> {
+    fn apply_filter(&mut self, tui: &mut Tui) -> Result<()> {
         if !self.any_filter_active() {
-            return self.read_from(self.stream(), out);
+            return self.read_from(self.stream(), tui);
         }
         let scan = MailSource::Filtered(FilteredSource::start(
             self.list_name.clone(),
@@ -306,16 +272,16 @@ impl App {
         ));
         // The scan has nothing yet, so this leaves the source's own loading
         // screen up; the run loop serves the page once matches arrive.
-        self.read_from(scan, out)
+        self.read_from(scan, tui)
     }
 
     /// Advance any background work and, if a page is still pending, try again to
     /// serve it. Returns true when the view changed and a redraw is warranted.
-    fn poll_source<W: Write>(&mut self, out: &mut W) -> Result<bool> {
+    fn poll_source(&mut self, tui: &mut Tui) -> Result<bool> {
         self.source.poll();
         match self.pending_page {
             Some(target) => {
-                self.resolve_page(target, out)?;
+                self.resolve_page(target, tui)?;
                 Ok(true)
             }
             None => Ok(false),
@@ -326,7 +292,7 @@ impl App {
     /// show it when ready, keep a loading screen up while work is pending, or
     /// prompt to clone the next epoch when the source is blocked. The page stays
     /// pending only while the source is still working on it.
-    fn resolve_page<W: Write>(&mut self, target: usize, out: &mut W) -> Result<()> {
+    fn resolve_page(&mut self, target: usize, tui: &mut Tui) -> Result<()> {
         self.pending_page = Some(target);
         loop {
             match self.source.status(target, self.page_size) {
@@ -343,7 +309,7 @@ impl App {
                 }
                 SourceStatus::Exhausted => break,
                 SourceStatus::NeedsClone(epoch) => {
-                    if !self.prompt_clone(epoch)? {
+                    if !self.prompt_clone(tui, epoch)? {
                         // The stream cannot get past a missing epoch; the filter
                         // drops it and tries the next uncloned one.
                         if self.source.decline_clone(epoch) {
@@ -355,7 +321,7 @@ impl App {
                         "Cloning {} epoch {} (this may take a while)…",
                         self.list_name, epoch
                     ));
-                    self.render(out)?;
+                    self.render(tui)?;
                     if archive::ensure_epoch(&self.list_name, epoch).is_err() {
                         break;
                     }
@@ -369,10 +335,10 @@ impl App {
     }
 
     /// Prompt the user to confirm cloning `epoch`. Returns whether they agreed.
-    fn prompt_clone(&self, epoch: u32) -> Result<bool> {
+    fn prompt_clone(&self, tui: &mut Tui, epoch: u32) -> Result<bool> {
         let label = format!("Clone {} epoch {}? [y/N]: ", self.list_name, epoch);
-        Ok(self
-            .handle_prompt(&label, |k, _| match k.code {
+        Ok(tui
+            .prompt(&label, |k, _| match k.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => PromptAction::Accept(()),
                 _ => PromptAction::Cancel,
             })?
@@ -396,7 +362,7 @@ impl App {
 
     /// Reply to the selected mail, with `$EDITOR` and `git send-email` owning
     /// the terminal while it runs.
-    fn reply_selected<W: Write>(&mut self, out: &mut W) -> Result<()> {
+    fn reply_selected(&mut self, tui: &mut Tui) -> Result<()> {
         let Some(draft) = self
             .current_page
             .mails
@@ -405,7 +371,7 @@ impl App {
         else {
             return Ok(());
         };
-        if let Err(e) = suspended(out, || reply::compose_and_send(&draft)) {
+        if let Err(e) = tui.suspended(|| reply::compose_and_send(&draft)) {
             self.view = View::Loading(format!("Reply not sent: {e}"));
         }
         Ok(())
@@ -413,18 +379,18 @@ impl App {
 
     /// Prompt for the target repo, then apply the selected mail's whole patch
     /// series with `git am`, with git owning the terminal while it runs.
-    fn apply_patch<W: Write>(&mut self, out: &mut W) -> Result<()> {
+    fn apply_patch(&mut self, tui: &mut Tui) -> Result<()> {
         let Some(mail) = self.current_page.mails.get(self.selected).cloned() else {
             return Ok(());
         };
         if mail.patch_tag.is_none() {
-            self.handle_prompt::<_, ()>("Not a patch mail. Press any key.", |_, _| {
+            tui.prompt::<_, ()>("Not a patch mail. Press any key.", |_, _| {
                 PromptAction::Cancel
             })?;
             return Ok(());
         }
         let label = format!("Apply series to git repo [{}]: ", self.repo_path);
-        let Some(answer) = self.prompt_text(&label)? else {
+        let Some(answer) = tui.prompt_line(&label)? else {
             return Ok(());
         };
         let answer = answer.trim();
@@ -440,7 +406,7 @@ impl App {
         }
 
         let list = self.list_name.clone();
-        let outcome = suspended(out, || {
+        let outcome = tui.suspended(|| {
             println!("Finding the rest of the series in the {list} mirror…");
             thread::patch_series(&list, &mail).and_then(|series| patch::apply(&target, &series))
         });
@@ -451,9 +417,10 @@ impl App {
     }
 
     /// Dispatch to the per-view renderer based on `self.view`.
-    fn render<W: Write>(&self, out: &mut W) -> Result<()> {
+    fn render(&self, tui: &mut Tui) -> Result<()> {
         let (epoch_label, page_label) = (self.epoch_label(), self.page_label());
         let header = self.header_info(&epoch_label, &page_label);
+        let out = tui.out();
         match &self.view {
             View::Loading(msg) => ui::draw_loading(out, &header, msg),
             View::List => ui::draw_list(out, &self.list_view(header, &self.empty_message())),
@@ -465,13 +432,13 @@ impl App {
     /// Redraw only the selected row, used for marquee ticks. Avoids the full
     /// screen clear in `render()` that would otherwise flicker at the tick
     /// rate. Safe to call when not in List view (it no-ops).
-    fn render_selected_title<W: Write>(&self, out: &mut W) -> Result<()> {
+    fn render_selected_title(&self, tui: &mut Tui) -> Result<()> {
         if !matches!(self.view, View::List) || self.current_page.is_empty() {
             return Ok(());
         }
         let (epoch_label, page_label) = (self.epoch_label(), self.page_label());
         let header = self.header_info(&epoch_label, &page_label);
-        ui::redraw_selected_row(out, &self.list_view(header, &[]))
+        ui::redraw_selected_row(tui.out(), &self.list_view(header, &[]))
     }
 
     /// What to say instead of rows when the page has none.
@@ -537,39 +504,30 @@ impl App {
     }
 
     pub fn run(&mut self) -> Result<()> {
-        let mut out = stdout();
-        enable_raw_mode()?;
-        execute!(out, EnterAlternateScreen)?;
-
-        let result = match self.initialize(&mut out) {
-            Ok(()) => self.run_loop(&mut out),
-            Err(e) => Err(e),
-        };
-
-        disable_raw_mode().ok();
-        execute!(out, LeaveAlternateScreen).ok();
-        result
+        let mut tui = Tui::enter()?;
+        self.initialize(&mut tui)?;
+        self.run_loop(&mut tui)
     }
 
-    fn initialize<W: Write>(&mut self, out: &mut W) -> Result<()> {
-        self.bootstrap_manifest(out)?;
-        self.bootstrap_mirror(out)?;
+    fn initialize(&mut self, tui: &mut Tui) -> Result<()> {
+        self.bootstrap_manifest(tui)?;
+        self.bootstrap_mirror(tui)?;
 
         self.view = View::Loading("Loading mails…".to_string());
-        self.render(out)?;
+        self.render(tui)?;
         // The unfiltered stream resolves synchronously, so this lands on the
         // list view (or an empty one) — nothing stays pending.
-        self.refresh(out)?;
-        self.render(out)
+        self.refresh(tui)?;
+        self.render(tui)
     }
 
-    fn run_loop<W: Write>(&mut self, out: &mut W) -> Result<()> {
+    fn run_loop(&mut self, tui: &mut Tui) -> Result<()> {
         loop {
-            if self.poll_source(out)? {
-                self.render(out)?;
+            if self.poll_source(tui)? {
+                self.render(tui)?;
             }
             if self.tick_title_scroll() {
-                self.render_selected_title(out)?;
+                self.render_selected_title(tui)?;
             }
             if event::poll(Duration::from_millis(250))? {
                 match event::read()? {
@@ -577,10 +535,10 @@ impl App {
                         if key.kind != KeyEventKind::Press {
                             continue;
                         }
-                        if self.handle_key(out, key)? {
+                        if self.handle_key(tui, key)? {
                             break;
                         }
-                        self.render(out)?;
+                        self.render(tui)?;
                     }
                     Event::Resize(_, _) => {
                         // The current page still starts where it did; every
@@ -589,8 +547,8 @@ impl App {
                         self.page_size = page_size_for_terminal();
                         let offset = self.current_page.offset;
                         self.page_offsets.retain(|&s| s <= offset);
-                        let _ = self.resolve_page(offset, out);
-                        self.render(out)?;
+                        let _ = self.resolve_page(offset, tui);
+                        self.render(tui)?;
                     }
                     _ => {}
                 }
@@ -599,51 +557,7 @@ impl App {
         Ok(())
     }
 
-    fn handle_prompt<F, R>(&self, label: &str, mut handle: F) -> Result<Option<R>>
-    where
-        F: FnMut(KeyEvent, &mut String) -> PromptAction<R>,
-    {
-        let mut out = stdout();
-        let mut input = String::new();
-
-        ui::redraw_prompt(&mut out, label, &input)?;
-
-        loop {
-            if let Event::Key(k) = event::read()? {
-                if k.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match handle(k, &mut input) {
-                    PromptAction::Continue => {}
-                    PromptAction::Cancel => return Ok(None),
-                    PromptAction::Accept(r) => return Ok(Some(r)),
-                }
-                ui::redraw_prompt(&mut out, label, &input)?;
-            }
-        }
-    }
-
-    /// Prompt for a line of text on the bottom bar with the usual editing keys:
-    /// Enter accepts, Esc cancels (→ `None`), Backspace deletes, and any
-    /// printable non-control character is appended. The shared shape behind the
-    /// filter prompts and the patch-repo prompt.
-    fn prompt_text(&self, label: &str) -> Result<Option<String>> {
-        self.handle_prompt(label, |k, input| match k.code {
-            KeyCode::Enter => PromptAction::Accept(input.clone()),
-            KeyCode::Esc => PromptAction::Cancel,
-            KeyCode::Backspace => {
-                input.pop();
-                PromptAction::Continue
-            }
-            KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
-                input.push(c);
-                PromptAction::Continue
-            }
-            _ => PromptAction::Continue,
-        })
-    }
-
-    fn handle_key<W: Write>(&mut self, out: &mut W, key: KeyEvent) -> Result<bool> {
+    fn handle_key(&mut self, tui: &mut Tui, key: KeyEvent) -> Result<bool> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
             return Ok(true);
         }
@@ -669,24 +583,24 @@ impl App {
                     }
                 }
                 KeyCode::Right => {
-                    let _ = self.next_page(out);
+                    let _ = self.next_page(tui);
                 }
                 KeyCode::Left => {
-                    let _ = self.prev_page(out);
+                    let _ = self.prev_page(tui);
                 }
                 KeyCode::Enter => {
                     let _ = self.open_selected();
                 }
-                KeyCode::Char('r') => self.reply_selected(out)?,
-                KeyCode::Char('p') => self.apply_patch(out)?,
+                KeyCode::Char('r') => self.reply_selected(tui)?,
+                KeyCode::Char('p') => self.apply_patch(tui)?,
                 KeyCode::Char('/') => {
                     let label = format!(
                         "Filter (subject substring, empty=clear) [{}]: ",
                         self.subject_filter
                     );
-                    if let Some(s) = self.prompt_text(&label)? {
+                    if let Some(s) = tui.prompt_line(&label)? {
                         self.subject_filter.set(&s);
-                        let _ = self.apply_filter(out);
+                        let _ = self.apply_filter(tui);
                     }
                 }
                 KeyCode::Char('a') => {
@@ -694,9 +608,9 @@ impl App {
                         "Filter (author substring, empty=clear) [{}]: ",
                         self.author_filter
                     );
-                    if let Some(s) = self.prompt_text(&label)? {
+                    if let Some(s) = tui.prompt_line(&label)? {
                         self.author_filter.set(&s);
-                        let _ = self.apply_filter(out);
+                        let _ = self.apply_filter(tui);
                     }
                 }
                 KeyCode::Char('d') => {
@@ -704,10 +618,10 @@ impl App {
                         "Filter date (today | yesterday | YYYY/MM/DD HH:MM to YYYY/MM/DD HH:MM, empty=clear) [{}]: ",
                         self.date_filter
                     );
-                    if let Some(s) = self.prompt_text(&label)? {
+                    if let Some(s) = tui.prompt_line(&label)? {
                         match self.date_filter.set(&s) {
                             Ok(()) => {
-                                let _ = self.apply_filter(out);
+                                let _ = self.apply_filter(tui);
                             }
                             Err(e) => {
                                 self.view = View::Loading(format!("Invalid date filter: {e}"));
@@ -720,17 +634,17 @@ impl App {
                         "Updating mirror {} epoch {}…",
                         self.list_name, self.cur_epoch
                     ));
-                    self.render(out)?;
+                    self.render(tui)?;
                     if archive::ensure_epoch(&self.list_name, self.cur_epoch).is_ok() {
                         self.view = View::Loading("Reloading mails…".to_string());
-                        self.render(out)?;
+                        self.render(tui)?;
                         if !self.any_filter_active() {
-                            let _ = self.refresh(out);
+                            let _ = self.refresh(tui);
                             self.view = View::List;
                         } else {
                             // Re-run the background filter against the updated
                             // mirror; apply_filter leaves the loading screen up.
-                            let _ = self.apply_filter(out);
+                            let _ = self.apply_filter(tui);
                         }
                     } else {
                         self.view = View::List;
@@ -743,8 +657,8 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => {
                     self.view = View::List;
                 }
-                KeyCode::Char('r') => self.reply_selected(out)?,
-                KeyCode::Char('p') => self.apply_patch(out)?,
+                KeyCode::Char('r') => self.reply_selected(tui)?,
+                KeyCode::Char('p') => self.apply_patch(tui)?,
                 KeyCode::Down => self.detail_scroll = self.detail_scroll.saturating_add(1),
                 KeyCode::Up => self.detail_scroll = self.detail_scroll.saturating_sub(1),
                 KeyCode::PageDown | KeyCode::Char(' ') => {

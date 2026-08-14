@@ -4,6 +4,7 @@ mod app;
 mod patch;
 mod reply;
 mod source;
+mod tui;
 mod ui;
 
 use anyhow::Result;
