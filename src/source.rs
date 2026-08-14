@@ -5,6 +5,7 @@
 //! here rather than in the shared `lkml-core` library, which stays about mail
 //! parsing and archive I/O.
 
+use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -41,8 +42,10 @@ pub struct Page {
     pub offset: usize,
 }
 
-/// Outcome of asking a mail source whether a given page can be served yet.
-pub enum SourceStatus {
+/// Internal outcome of asking a source whether a page can be served yet.
+/// `NeedsClone` never escapes this module: `MailSource::page` negotiates it
+/// away before answering the caller.
+enum SourceStatus {
     /// The page is ready.
     Ready(Page),
     /// Still working; show this loading message.
@@ -51,6 +54,17 @@ pub enum SourceStatus {
     NeedsClone(u32),
     /// No more mails to show.
     Exhausted,
+}
+
+/// Outcome of asking a source for a page.
+pub enum PageState {
+    /// The page is ready.
+    Ready(Page),
+    /// Still working; show this message and ask again later.
+    Pending(String),
+    /// No page to serve: the stream ran out, a needed clone was declined, or
+    /// cloning failed.
+    End,
 }
 
 impl Page {
@@ -180,7 +194,7 @@ impl StreamSource {
     /// page still cuts a patch series in half. Returns `NeedsClone` for the
     /// first epoch that must be cloned to make progress, or `Exhausted` past
     /// the end of the stream.
-    pub fn status(&mut self, offset: usize, page_size: usize) -> SourceStatus {
+    fn status(&mut self, offset: usize, page_size: usize) -> SourceStatus {
         if self.available_epochs.is_empty() {
             return SourceStatus::Exhausted;
         }
@@ -316,7 +330,7 @@ impl FilteredSource {
     }
 
     /// Drain the worker's channel into `results`.
-    pub fn poll(&mut self) {
+    fn poll(&mut self) {
         loop {
             match self.rx.try_recv() {
                 Ok(mail) => self.results.push(mail),
@@ -342,7 +356,7 @@ impl FilteredSource {
     /// Decide whether the page at `offset` can be served yet: ready once enough
     /// matches exist (or the worker is done), otherwise loading, or — when the
     /// scan is done and results run out — the next epoch to clone.
-    pub fn status(&self, offset: usize, page_size: usize) -> SourceStatus {
+    fn status(&self, offset: usize, page_size: usize) -> SourceStatus {
         let needed = offset + page_size;
         let len = self.results.len();
 
@@ -365,13 +379,13 @@ impl FilteredSource {
         }
     }
 
-    pub fn discard_uncloned(&mut self, epoch: u32) {
+    fn discard_uncloned(&mut self, epoch: u32) {
         self.uncloned.retain(|&e| e != epoch);
     }
 
     /// Resume scanning over `epoch` — just cloned — so its matches are appended
     /// to the existing results.
-    pub fn extend(&mut self, epoch: u32) {
+    fn extend(&mut self, epoch: u32) {
         self.discard_uncloned(epoch);
         let (rx, cancel) = spawn_worker(
             self.list_name.clone(),
@@ -464,8 +478,47 @@ impl MailSource {
         }
     }
 
+    /// Serve the page starting at `offset`, negotiating any missing epochs
+    /// along the way. `consent` is asked once per missing epoch and answers
+    /// whether the user agreed to clone it (having painted its own progress
+    /// screen first — cloning blocks). Everything else stays internal: the
+    /// clone itself, resuming the filter worker over a fresh epoch, and
+    /// whether a refusal stops the stream or just skips the epoch.
+    pub fn page(
+        &mut self,
+        offset: usize,
+        page_size: usize,
+        consent: &mut dyn FnMut(u32) -> Result<bool>,
+    ) -> Result<PageState> {
+        self.poll();
+        loop {
+            match self.status(offset, page_size) {
+                SourceStatus::Ready(page) => return Ok(PageState::Ready(page)),
+                SourceStatus::Loading(message) => return Ok(PageState::Pending(message)),
+                SourceStatus::Exhausted => return Ok(PageState::End),
+                SourceStatus::NeedsClone(epoch) => {
+                    if consent(epoch)? {
+                        if archive::ensure_epoch(self.list_name(), epoch).is_err() {
+                            return Ok(PageState::End);
+                        }
+                        self.on_cloned(epoch);
+                    } else if !self.decline_clone(epoch) {
+                        return Ok(PageState::End);
+                    }
+                }
+            }
+        }
+    }
+
+    fn list_name(&self) -> &str {
+        match self {
+            MailSource::Stream(s) => &s.list_name,
+            MailSource::Filtered(f) => &f.list_name,
+        }
+    }
+
     /// Ask whether the page starting at `offset` can be served yet.
-    pub fn status(&mut self, offset: usize, page_size: usize) -> SourceStatus {
+    fn status(&mut self, offset: usize, page_size: usize) -> SourceStatus {
         match self {
             MailSource::Stream(s) => s.status(offset, page_size),
             MailSource::Filtered(f) => f.status(offset, page_size),
@@ -474,7 +527,7 @@ impl MailSource {
 
     /// Resume after `epoch` was just cloned. The stream picks it up on the next
     /// `status` walk; the filter restarts its worker over the new epoch.
-    pub fn on_cloned(&mut self, epoch: u32) {
+    fn on_cloned(&mut self, epoch: u32) {
         if let MailSource::Filtered(f) = self {
             f.extend(epoch);
         }
@@ -483,7 +536,7 @@ impl MailSource {
     /// Handle the user declining to clone `epoch`. Returns whether the source
     /// can still make progress: the stream stops at the missing epoch, while
     /// the filter drops it and tries the next uncloned epoch.
-    pub fn decline_clone(&mut self, epoch: u32) -> bool {
+    fn decline_clone(&mut self, epoch: u32) -> bool {
         match self {
             MailSource::Stream(_) => false,
             MailSource::Filtered(f) => {

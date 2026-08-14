@@ -14,7 +14,7 @@ use lkml_core::thread;
 use crate::pages::Pages;
 use crate::patch;
 use crate::reply;
-use crate::source::{FilteredSource, MailSource, SourceStatus, StreamSource};
+use crate::source::{FilteredSource, MailSource, PageState, StreamSource};
 use crate::tui::{PromptAction, Tui};
 use crate::ui;
 
@@ -260,47 +260,46 @@ impl App {
     }
 
     /// Drive the active source toward serving the page starting at `target`:
-    /// show it when ready, keep a loading screen up while work is pending, or
-    /// prompt to clone the next epoch when the source is blocked. The page stays
-    /// pending only while the source is still working on it.
+    /// show it when ready, or keep a loading screen up while work is pending.
+    /// Clone negotiation happens inside the source; the app only supplies the
+    /// consent prompt (and its progress screen). The page stays pending only
+    /// while the source is still working on it.
     fn resolve_page(&mut self, target: usize, tui: &mut Tui) -> Result<()> {
         self.pages.begin(target);
-        loop {
-            match self.source.status(target, self.pages.page_size()) {
-                SourceStatus::Ready(page) => {
-                    self.pages.accept(page);
-                    self.reset_title_scroll();
-                    break;
-                }
-                SourceStatus::Loading(message) => {
-                    self.view = View::Loading(message);
-                    return Ok(());
-                }
-                SourceStatus::Exhausted => break,
-                SourceStatus::NeedsClone(epoch) => {
-                    if !self.prompt_clone(tui, epoch)? {
-                        // The stream cannot get past a missing epoch; the filter
-                        // drops it and tries the next uncloned one.
-                        if self.source.decline_clone(epoch) {
-                            continue;
-                        }
-                        break;
-                    }
-                    self.view = View::Loading(format!(
-                        "Cloning {} epoch {} (this may take a while)…",
-                        self.list_name, epoch
-                    ));
-                    self.render(tui)?;
-                    if archive::ensure_epoch(&self.list_name, epoch).is_err() {
-                        break;
-                    }
-                    self.source.on_cloned(epoch);
-                }
+        // The source is moved out for the call so the consent adapter may
+        // borrow the rest of the app to prompt and paint.
+        let mut source = std::mem::replace(&mut self.source, App::empty_source());
+        let state = source.page(target, self.pages.page_size(), &mut |epoch| {
+            if !self.prompt_clone(tui, epoch)? {
+                return Ok(false);
             }
+            self.view = View::Loading(format!(
+                "Cloning {} epoch {} (this may take a while)…",
+                self.list_name, epoch
+            ));
+            self.render(tui)?;
+            Ok(true)
+        });
+        self.source = source;
+        match state? {
+            PageState::Ready(page) => {
+                self.pages.accept(page);
+                self.reset_title_scroll();
+            }
+            PageState::Pending(message) => {
+                self.view = View::Loading(message);
+                return Ok(());
+            }
+            PageState::End => {}
         }
         self.pages.settle();
         self.view = View::List;
         Ok(())
+    }
+
+    /// A stand-in source with nothing in it, for `resolve_page`'s swap.
+    fn empty_source() -> MailSource {
+        MailSource::Stream(StreamSource::new(String::new(), Vec::new()))
     }
 
     /// Prompt the user to confirm cloning `epoch`. Returns whether they agreed.
