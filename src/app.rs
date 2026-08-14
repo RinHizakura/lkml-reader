@@ -128,7 +128,7 @@ impl App {
             mail,
             page.offset,
             page.mails.len(),
-            page.indent[self.pages.selected()],
+            page.indented(self.pages.selected()),
         ) {
             if self.selected_title_scroll != 0 {
                 self.selected_title_scroll = 0;
@@ -423,7 +423,7 @@ impl App {
             header,
             offset: self.pages.current().offset,
             mails: &self.pages.current().mails,
-            indent: &self.pages.current().indent,
+            indent: self.pages.current().indent(),
             selected: self.pages.selected(),
             scroll: self.pages.scroll(),
             selected_scroll: self.selected_title_scroll,

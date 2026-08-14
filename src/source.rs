@@ -38,7 +38,9 @@ const CHASE_READAHEAD: usize = 16;
 pub struct Page {
     pub mails: Vec<Mail>,
     /// Per row: this mail sits under a series head and is drawn indented.
-    pub indent: Vec<bool>,
+    /// Always exactly as long as `mails` — private so only the constructors
+    /// here, which build the two in lockstep, can establish that.
+    indent: Vec<bool>,
     pub offset: usize,
 }
 
@@ -97,6 +99,16 @@ impl Page {
 
     pub fn len(&self) -> usize {
         self.mails.len()
+    }
+
+    /// Whether row `i` sits under a series head; false past the page's end.
+    pub fn indented(&self, i: usize) -> bool {
+        self.indent.get(i).copied().unwrap_or(false)
+    }
+
+    /// One indent flag per row of `mails`.
+    pub fn indent(&self) -> &[bool] {
+        &self.indent
     }
 }
 
