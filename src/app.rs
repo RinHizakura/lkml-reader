@@ -11,9 +11,10 @@ use lkml_core::archive;
 use lkml_core::filter::{DateFilter, Filter, NameFilter};
 use lkml_core::thread;
 
+use crate::pages::Pages;
 use crate::patch;
 use crate::reply;
-use crate::source::{FilteredSource, MailSource, Page, SourceStatus, StreamSource};
+use crate::source::{FilteredSource, MailSource, SourceStatus, StreamSource};
 use crate::tui::{PromptAction, Tui};
 use crate::ui;
 
@@ -43,21 +44,10 @@ pub struct App {
     /// scan. Owns its own caches; the app drives which page it serves.
     source: MailSource,
 
-    page_size: usize,
-    current_page: Page,
-    /// Where every page visited so far starts in the stream, ascending. Pages
-    /// are variable-length — one holding a long patch series runs past the
-    /// window — so a page is found by its offset, and this is what makes
-    /// stepping back to the previous one possible.
-    page_offsets: Vec<usize>,
-    /// Where the page we are trying to show starts, while the source is still
-    /// working on it. `None` once it has been served (or given up on); only a
-    /// filtered scan ever keeps one pending across run-loop ticks.
-    pending_page: Option<usize>,
-    selected: usize,
-    /// First row of the current page shown on screen. Non-zero only when the
-    /// page is taller than the window.
-    list_scroll: usize,
+    /// Which page is showing, the visited-page history, the selection and the
+    /// window scroll. Only a filtered scan ever keeps a page pending across
+    /// run-loop ticks.
+    pages: Pages,
 
     view: View,
     detail_text: String,
@@ -107,12 +97,7 @@ impl App {
             cur_epoch: 0,
             repo_ready: false,
             source,
-            page_size: page_size_for_terminal(),
-            current_page: Page::default(),
-            page_offsets: vec![0],
-            pending_page: None,
-            selected: 0,
-            list_scroll: 0,
+            pages: Pages::new(page_size_for_terminal()),
             view: View::Loading("Starting…".to_string()),
             detail_text: String::new(),
             detail_scroll: 0,
@@ -135,15 +120,16 @@ impl App {
         if !matches!(self.view, View::List) {
             return false;
         }
-        let Some(mail) = self.current_page.mails.get(self.selected) else {
+        let Some(mail) = self.pages.selected_mail() else {
             return false;
         };
         let (cols, _) = size().unwrap_or((80, 24));
+        let page = self.pages.current();
         let subject_w = ui::subject_column_width(
             cols,
-            self.current_page.offset,
-            self.current_page.mails.len(),
-            self.current_page.indent[self.selected],
+            page.offset,
+            page.mails.len(),
+            page.indent[self.pages.selected()],
         );
         if mail.subject.chars().count() <= subject_w {
             if self.selected_title_scroll != 0 {
@@ -200,10 +186,8 @@ impl App {
     /// the source it replaces cancels any worker that one owned.
     fn read_from(&mut self, source: MailSource, tui: &mut Tui) -> Result<()> {
         self.source = source;
-        self.current_page = Page::default();
-        self.page_offsets = vec![0];
-        self.selected = 0;
-        self.resolve_page(0, tui)
+        let target = self.pages.reset();
+        self.resolve_page(target, tui)
     }
 
     /// The unfiltered stream over every epoch we know of.
@@ -220,33 +204,20 @@ impl App {
         self.read_from(self.stream(), tui)
     }
 
-    /// Step to the page after the current one. Where it starts depends on how
-    /// long this one turned out to be, so the boundary is only known once the
-    /// current page has been served — remember it for the way back.
+    /// Step to the page after the current one, if it has anywhere to start.
     fn next_page(&mut self, tui: &mut Tui) -> Result<()> {
-        if self.current_page.is_empty() {
-            return Ok(());
+        match self.pages.next_target() {
+            Some(target) => self.resolve_page(target, tui),
+            None => Ok(()),
         }
-        let target = self.current_page.offset + self.current_page.len();
-        // Offsets ascend, so a boundary we have already crossed is at or before
-        // the end; only a brand new one goes past it.
-        if self.page_offsets.last() < Some(&target) {
-            self.page_offsets.push(target);
-        }
-        self.resolve_page(target, tui)
     }
 
     /// Step back to the page before the current one, stopping at the first.
     fn prev_page(&mut self, tui: &mut Tui) -> Result<()> {
-        let Some(pos) = self
-            .page_offsets
-            .iter()
-            .position(|&s| s == self.current_page.offset)
-            .filter(|&pos| pos > 0)
-        else {
-            return Ok(());
-        };
-        self.resolve_page(self.page_offsets[pos - 1], tui)
+        match self.pages.prev_target() {
+            Some(target) => self.resolve_page(target, tui),
+            None => Ok(()),
+        }
     }
 
     /// Whether any filter constrains the stream.
@@ -279,7 +250,7 @@ impl App {
     /// serve it. Returns true when the view changed and a redraw is warranted.
     fn poll_source(&mut self, tui: &mut Tui) -> Result<bool> {
         self.source.poll();
-        match self.pending_page {
+        match self.pages.pending() {
             Some(target) => {
                 self.resolve_page(target, tui)?;
                 Ok(true)
@@ -293,13 +264,11 @@ impl App {
     /// prompt to clone the next epoch when the source is blocked. The page stays
     /// pending only while the source is still working on it.
     fn resolve_page(&mut self, target: usize, tui: &mut Tui) -> Result<()> {
-        self.pending_page = Some(target);
+        self.pages.begin(target);
         loop {
-            match self.source.status(target, self.page_size) {
+            match self.source.status(target, self.pages.page_size()) {
                 SourceStatus::Ready(page) => {
-                    self.current_page = page;
-                    self.selected = 0;
-                    self.list_scroll = 0;
+                    self.pages.accept(page);
                     self.reset_title_scroll();
                     break;
                 }
@@ -329,7 +298,7 @@ impl App {
                 }
             }
         }
-        self.pending_page = None;
+        self.pages.settle();
         self.view = View::List;
         Ok(())
     }
@@ -346,12 +315,7 @@ impl App {
     }
 
     fn open_selected(&mut self) -> Result<()> {
-        let Some(text) = self
-            .current_page
-            .mails
-            .get(self.selected)
-            .map(|mail| mail.render_full())
-        else {
+        let Some(text) = self.pages.selected_mail().map(|mail| mail.render_full()) else {
             return Ok(());
         };
         self.detail_text = text;
@@ -363,12 +327,7 @@ impl App {
     /// Reply to the selected mail, with `$EDITOR` and `git send-email` owning
     /// the terminal while it runs.
     fn reply_selected(&mut self, tui: &mut Tui) -> Result<()> {
-        let Some(draft) = self
-            .current_page
-            .mails
-            .get(self.selected)
-            .map(|mail| mail.reply_draft())
-        else {
+        let Some(draft) = self.pages.selected_mail().map(|mail| mail.reply_draft()) else {
             return Ok(());
         };
         if let Err(e) = tui.suspended(|| reply::compose_and_send(&draft)) {
@@ -380,7 +339,7 @@ impl App {
     /// Prompt for the target repo, then apply the selected mail's whole patch
     /// series with `git am`, with git owning the terminal while it runs.
     fn apply_patch(&mut self, tui: &mut Tui) -> Result<()> {
-        let Some(mail) = self.current_page.mails.get(self.selected).cloned() else {
+        let Some(mail) = self.pages.selected_mail().cloned() else {
             return Ok(());
         };
         if mail.patch_tag.is_none() {
@@ -418,7 +377,7 @@ impl App {
 
     /// Dispatch to the per-view renderer based on `self.view`.
     fn render(&self, tui: &mut Tui) -> Result<()> {
-        let (epoch_label, page_label) = (self.epoch_label(), self.page_label());
+        let (epoch_label, page_label) = (self.epoch_label(), self.pages.label());
         let header = self.header_info(&epoch_label, &page_label);
         let out = tui.out();
         match &self.view {
@@ -433,17 +392,17 @@ impl App {
     /// screen clear in `render()` that would otherwise flicker at the tick
     /// rate. Safe to call when not in List view (it no-ops).
     fn render_selected_title(&self, tui: &mut Tui) -> Result<()> {
-        if !matches!(self.view, View::List) || self.current_page.is_empty() {
+        if !matches!(self.view, View::List) || self.pages.current().is_empty() {
             return Ok(());
         }
-        let (epoch_label, page_label) = (self.epoch_label(), self.page_label());
+        let (epoch_label, page_label) = (self.epoch_label(), self.pages.label());
         let header = self.header_info(&epoch_label, &page_label);
         ui::redraw_selected_row(tui.out(), &self.list_view(header, &[]))
     }
 
     /// What to say instead of rows when the page has none.
     fn empty_message(&self) -> Vec<String> {
-        if !self.current_page.is_empty() {
+        if !self.pages.current().is_empty() {
             Vec::new()
         } else if !self.repo_ready {
             vec![
@@ -465,11 +424,11 @@ impl App {
     ) -> ui::ListView<'a> {
         ui::ListView {
             header,
-            offset: self.current_page.offset,
-            mails: &self.current_page.mails,
-            indent: &self.current_page.indent,
-            selected: self.selected,
-            scroll: self.list_scroll,
+            offset: self.pages.current().offset,
+            mails: &self.pages.current().mails,
+            indent: &self.pages.current().indent,
+            selected: self.pages.selected(),
+            scroll: self.pages.scroll(),
             selected_scroll: self.selected_title_scroll,
             empty_message,
         }
@@ -491,16 +450,6 @@ impl App {
             0 => "-".to_string(),
             n => format!("{} (newest of {n})", self.cur_epoch),
         }
-    }
-
-    /// Pages have no index of their own — they are stream offsets — so the label
-    /// is how many page boundaries we have crossed to reach this one.
-    fn page_label(&self) -> String {
-        self.page_offsets
-            .iter()
-            .position(|&s| s == self.current_page.offset)
-            .map_or(1, |pos| pos + 1)
-            .to_string()
     }
 
     pub fn run(&mut self) -> Result<()> {
@@ -541,13 +490,8 @@ impl App {
                         self.render(tui)?;
                     }
                     Event::Resize(_, _) => {
-                        // The current page still starts where it did; every
-                        // boundary after it was cut for the old page size and is
-                        // now wrong, so forget them and re-serve this page.
-                        self.page_size = page_size_for_terminal();
-                        let offset = self.current_page.offset;
-                        self.page_offsets.retain(|&s| s <= offset);
-                        let _ = self.resolve_page(offset, tui);
+                        let target = self.pages.resize(page_size_for_terminal());
+                        let _ = self.resolve_page(target, tui);
                         self.render(tui)?;
                     }
                     _ => {}
@@ -565,20 +509,12 @@ impl App {
             View::List => match key.code {
                 KeyCode::Char('q') => return Ok(true),
                 KeyCode::Down => {
-                    if self.selected + 1 < self.current_page.len() {
-                        self.selected += 1;
-                        // A page holding a long series runs past the window;
-                        // follow the selection down into it.
-                        if self.selected >= self.list_scroll + self.page_size {
-                            self.list_scroll = self.selected + 1 - self.page_size;
-                        }
+                    if self.pages.select_next() {
                         self.reset_title_scroll();
                     }
                 }
                 KeyCode::Up => {
-                    if self.selected > 0 {
-                        self.selected -= 1;
-                        self.list_scroll = self.list_scroll.min(self.selected);
+                    if self.pages.select_prev() {
                         self.reset_title_scroll();
                     }
                 }
