@@ -182,6 +182,56 @@ fn is_whole(mails: &[Mail], tag: &SeriesTag) -> bool {
     (1..=tag.total).all(|n| seen.contains(&n))
 }
 
+/// The subject, author and date constraints as one value. What is pushed down
+/// into `git log`, what runs as a Rust-side predicate on the survivors, and
+/// how a scan reports progress all come from here — the one home for the two
+/// representations of "matches".
+#[derive(Clone)]
+pub struct FilterSet {
+    pub subject: NameFilter,
+    pub author: NameFilter,
+    pub date: DateFilter,
+}
+
+impl FilterSet {
+    pub fn new() -> Self {
+        Self {
+            subject: NameFilter::subject(),
+            author: NameFilter::author(),
+            date: DateFilter::new(),
+        }
+    }
+
+    /// Whether any constraint is set.
+    pub fn is_active(&self) -> bool {
+        self.subject.is_active() || self.author.is_active() || self.date.is_active()
+    }
+
+    /// The needles `git log` narrows an epoch by: (subject, author).
+    fn search_args(&self) -> (Option<&str>, Option<&str>) {
+        (
+            self.subject.needle.as_deref(),
+            self.author.needle.as_deref(),
+        )
+    }
+
+    /// The Rust-side predicate for what the git pushdown cannot narrow.
+    fn matches(&self, mail: &Mail) -> bool {
+        self.date.matches(mail)
+    }
+
+    /// The loading-screen line for a scan with `count` matches so far.
+    fn progress(&self, count: usize) -> String {
+        format!(
+            "Filtering subject='{}' author='{}' date='{}'… ({count} match{} so far)",
+            self.subject,
+            self.author,
+            self.date,
+            if count == 1 { "" } else { "es" }
+        )
+    }
+}
+
 /// The unfiltered mail stream: every mail across all epochs, newest-first.
 /// Pages are materialized lazily by walking epochs only as far as needed, with
 /// per-epoch commit hashes cached on first visit.
@@ -287,9 +337,7 @@ impl StreamSource {
 /// there. Dropping the source cancels its worker.
 pub struct FilteredSource {
     list_name: String,
-    subject: NameFilter,
-    author: NameFilter,
-    date: DateFilter,
+    filters: FilterSet,
     rx: Receiver<Mail>,
     cancel: Arc<AtomicBool>,
     results: Vec<Mail>,
@@ -300,18 +348,12 @@ pub struct FilteredSource {
 }
 
 impl FilteredSource {
-    /// Start a background scan over `available_epochs` for mails matching the
-    /// given filters. At least one filter should be active; an entirely inert
-    /// set is allowed but pointless (caller should use the unfiltered stream
+    /// Start a background scan over `available_epochs` for mails matching
+    /// `filters`. At least one filter should be active; an entirely inert set
+    /// is allowed but pointless (caller should use the unfiltered stream
     /// instead). Epochs present locally are scanned right away; the rest are
     /// queued for on-demand cloning.
-    pub fn start(
-        list_name: String,
-        subject: NameFilter,
-        author: NameFilter,
-        date: DateFilter,
-        available_epochs: &[u32],
-    ) -> Self {
+    pub fn start(list_name: String, filters: FilterSet, available_epochs: &[u32]) -> Self {
         let mut scan: Vec<u32> = Vec::new();
         let mut uncloned: Vec<u32> = Vec::new();
         for &epoch in available_epochs.iter().rev() {
@@ -321,18 +363,10 @@ impl FilteredSource {
                 uncloned.push(epoch);
             }
         }
-        let (rx, cancel) = spawn_worker(
-            list_name.clone(),
-            scan,
-            subject.clone(),
-            author.clone(),
-            date.clone(),
-        );
+        let (rx, cancel) = spawn_worker(list_name.clone(), scan, filters.clone());
         Self {
             list_name,
-            subject,
-            author,
-            date,
+            filters,
             rx,
             cancel,
             results: Vec::new(),
@@ -380,14 +414,7 @@ impl FilteredSource {
                 None => SourceStatus::Exhausted,
             }
         } else {
-            SourceStatus::Loading(format!(
-                "Filtering subject='{}' author='{}' date='{}'… ({} match{} so far)",
-                self.subject,
-                self.author,
-                self.date,
-                len,
-                if len == 1 { "" } else { "es" }
-            ))
+            SourceStatus::Loading(self.filters.progress(len))
         }
     }
 
@@ -399,13 +426,7 @@ impl FilteredSource {
     /// to the existing results.
     fn extend(&mut self, epoch: u32) {
         self.discard_uncloned(epoch);
-        let (rx, cancel) = spawn_worker(
-            self.list_name.clone(),
-            vec![epoch],
-            self.subject.clone(),
-            self.author.clone(),
-            self.date.clone(),
-        );
+        let (rx, cancel) = spawn_worker(self.list_name.clone(), vec![epoch], self.filters.clone());
         self.rx = rx;
         self.cancel = cancel;
         self.done = false;
@@ -424,14 +445,12 @@ const FILTER_CHUNK: usize = 64;
 /// Spawn a worker that scans `epochs` (newest-first) and sends every mail that
 /// satisfies all filters. Subject and author are pushed down into `git log`,
 /// which narrows a whole epoch in about a second; only the surviving commits
-/// are read and parsed, and the date filter runs on those. Stops promptly when
-/// `cancel` is set or the receiver is dropped.
+/// are read and parsed, and the rest of the predicate runs on those. Stops
+/// promptly when `cancel` is set or the receiver is dropped.
 fn spawn_worker(
     list: String,
     epochs: Vec<u32>,
-    subject: NameFilter,
-    author: NameFilter,
-    date: DateFilter,
+    filters: FilterSet,
 ) -> (Receiver<Mail>, Arc<AtomicBool>) {
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -444,12 +463,8 @@ fn spawn_worker(
             if !archive::repo_exists(&list, epoch) {
                 continue;
             }
-            let Ok(commits) = archive::search_commits(
-                &list,
-                epoch,
-                subject.needle.as_deref(),
-                author.needle.as_deref(),
-            ) else {
+            let (subject, author) = filters.search_args();
+            let Ok(commits) = archive::search_commits(&list, epoch, subject, author) else {
                 continue;
             };
             // In chunks, so one git process serves many matches — a broad filter
@@ -464,7 +479,7 @@ fn spawn_worker(
                     continue;
                 };
                 for mail in mails {
-                    if date.matches(&mail) && tx.send(mail).is_err() {
+                    if filters.matches(&mail) && tx.send(mail).is_err() {
                         return;
                     }
                 }
