@@ -42,6 +42,13 @@ pub struct ListView<'a> {
 
 /// First row below the header bar: where every view's content starts.
 const CONTENT_TOP: u16 = 1;
+
+/// Rows the content area holds: everything between the header and the hotkey
+/// line. Also the page size the app should request, so list paging and what
+/// `draw_list_body` can show never drift apart.
+pub fn content_rows(rows: u16) -> usize {
+    rows.saturating_sub(1).saturating_sub(CONTENT_TOP) as usize
+}
 /// What a patch hangs under its series head by.
 const INDENT: &str = "  ↳ ";
 /// List row layout: `%Y/%m/%d %H:%M` fits in 16, a display name in 24.
@@ -49,19 +56,19 @@ const DATE_W: usize = 16;
 const AUTHOR_W: usize = 24;
 
 /// Paint a whole screen: header bar, `body` in the space between, hotkey bar.
-/// `body` is handed the width and the first row past the content area, and is
-/// skipped outright on a window too short to have one — so no body has to guard
+/// `body` is handed the width and the content row count, and is skipped
+/// outright on a window too short to have any — so no body has to guard
 /// against that itself.
 fn draw_frame<W: Write, F>(out: &mut W, header: &HeaderInfo, hint: &str, body: F) -> Result<()>
 where
-    F: FnOnce(&mut W, u16, u16) -> Result<()>,
+    F: FnOnce(&mut W, u16, usize) -> Result<()>,
 {
     let (cols, rows) = size()?;
-    let bottom = rows.saturating_sub(1);
+    let visible = content_rows(rows);
     queue!(out, Hide, Clear(ClearType::All))?;
     draw_header(out, header, cols)?;
-    if bottom > CONTENT_TOP {
-        body(out, cols, bottom)?;
+    if visible > 0 {
+        body(out, cols, visible)?;
     }
     draw_hotkeys(out, hint, cols, rows)?;
     out.flush()?;
@@ -69,8 +76,8 @@ where
 }
 
 pub fn draw_loading<W: Write>(out: &mut W, header: &HeaderInfo, message: &str) -> Result<()> {
-    draw_frame(out, header, "", |out, cols, bottom| {
-        draw_centered(out, &format!("⏳  {message}"), cols, bottom)
+    draw_frame(out, header, "", |out, cols, visible| {
+        draw_centered(out, &format!("⏳  {message}"), cols, visible)
     })
 }
 
@@ -79,7 +86,7 @@ pub fn draw_list<W: Write>(out: &mut W, view: &ListView) -> Result<()> {
         out,
         &view.header,
         "↑/↓ select  ←/→ page  Enter view  r reply  p apply  / subject  a author  d date  u update  ? help  q quit",
-        |out, cols, bottom| draw_list_body(out, view, cols, bottom),
+        |out, cols, visible| draw_list_body(out, view, cols, visible),
     )
 }
 
@@ -93,7 +100,7 @@ pub fn draw_detail<W: Write>(
         out,
         header,
         "↑/↓/PgUp/PgDn scroll  g/G top/bottom  r reply  p apply  Esc/q back",
-        |out, cols, bottom| draw_detail_body(out, text, scroll, cols, bottom),
+        |out, cols, visible| draw_detail_body(out, text, scroll, cols, visible),
     )
 }
 
@@ -101,8 +108,9 @@ pub fn draw_help<W: Write>(out: &mut W, header: &HeaderInfo) -> Result<()> {
     draw_frame(out, header, "press any key to return", draw_help_body)
 }
 
-pub fn redraw_prompt<W: Write>(out: &mut W, label: &str, input: &str, y: u16) -> Result<()> {
-    let (cols, _) = size()?;
+pub fn redraw_prompt<W: Write>(out: &mut W, label: &str, input: &str) -> Result<()> {
+    let (cols, rows) = size()?;
+    let y = rows.saturating_sub(1);
     let max_w = (cols as usize).saturating_sub(1);
     let combined = format!("{}{}", label, input);
     let total = combined.chars().count();
@@ -140,8 +148,8 @@ fn draw_header<W: Write>(out: &mut W, h: &HeaderInfo, cols: u16) -> Result<()> {
     Ok(())
 }
 
-fn draw_centered<W: Write>(out: &mut W, msg: &str, cols: u16, bottom: u16) -> Result<()> {
-    let y = CONTENT_TOP + (bottom - CONTENT_TOP) / 2;
+fn draw_centered<W: Write>(out: &mut W, msg: &str, cols: u16, visible: usize) -> Result<()> {
+    let y = CONTENT_TOP + (visible / 2) as u16;
     let x = ((cols as usize).saturating_sub(msg.chars().count()) / 2) as u16;
     queue!(
         out,
@@ -153,16 +161,13 @@ fn draw_centered<W: Write>(out: &mut W, msg: &str, cols: u16, bottom: u16) -> Re
     Ok(())
 }
 
-fn draw_list_body<W: Write>(out: &mut W, view: &ListView, cols: u16, bottom: u16) -> Result<()> {
-    let visible = (bottom - CONTENT_TOP) as usize;
-
+fn draw_list_body<W: Write>(out: &mut W, view: &ListView, cols: u16, visible: usize) -> Result<()> {
     if view.mails.is_empty() {
         for (i, line) in view.empty_message.iter().enumerate() {
-            let y = CONTENT_TOP + 1 + i as u16;
-            if y >= bottom {
+            if i + 1 >= visible {
                 break;
             }
-            queue!(out, MoveTo(2, y), Print(line))?;
+            queue!(out, MoveTo(2, CONTENT_TOP + 1 + i as u16), Print(line))?;
         }
         return Ok(());
     }
@@ -237,8 +242,7 @@ fn queue_list_row<W: Write>(
 /// the tick rate).
 pub fn redraw_selected_row<W: Write>(out: &mut W, view: &ListView) -> Result<()> {
     let (cols, rows) = size()?;
-    let bottom = rows.saturating_sub(1);
-    if bottom <= CONTENT_TOP || view.selected >= view.mails.len() || view.selected < view.scroll {
+    if content_rows(rows) == 0 || view.selected >= view.mails.len() || view.selected < view.scroll {
         return Ok(());
     }
     queue!(out, Hide)?;
@@ -253,9 +257,8 @@ fn draw_detail_body<W: Write>(
     text: &str,
     scroll: usize,
     cols: u16,
-    bottom: u16,
+    visible: usize,
 ) -> Result<()> {
-    let visible = (bottom - CONTENT_TOP) as usize;
     let lines: Vec<&str> = text.lines().collect();
     let max_scroll = lines.len().saturating_sub(visible);
     let scroll = scroll.min(max_scroll);
@@ -305,7 +308,7 @@ fn diff_line_color(line: &str, in_hunk: &mut bool) -> Option<Color> {
     }
 }
 
-fn draw_help_body<W: Write>(out: &mut W, cols: u16, bottom: u16) -> Result<()> {
+fn draw_help_body<W: Write>(out: &mut W, cols: u16, visible: usize) -> Result<()> {
     let lines = [
         "LKML Reader — Keys",
         "",
@@ -331,10 +334,10 @@ fn draw_help_body<W: Write>(out: &mut W, cols: u16, bottom: u16) -> Result<()> {
     ];
     let top = 2u16;
     for (i, line) in lines.iter().enumerate() {
-        let y = top + i as u16;
-        if y >= bottom {
+        if i + 1 >= visible {
             break;
         }
+        let y = top + i as u16;
         queue!(
             out,
             MoveTo(2, y),

@@ -83,11 +83,11 @@ pub struct App {
     scroll_last_tick: Instant,
 }
 
-/// Rows a page fills: the whole window bar the header and the hotkey line. Also
-/// the height the list scrolls by when a page outgrows the window.
+/// Rows a page fills — whatever the ui's content area can show. Floored at 1
+/// so a degenerate window never asks the source for empty pages.
 fn page_size_for_terminal() -> usize {
     let (_, rows) = size().unwrap_or((80, 24));
-    (rows as usize).saturating_sub(2).max(10)
+    ui::content_rows(rows).max(1)
 }
 
 /// Expand a leading `~`/`~/…` to `$HOME`, like a shell would. `git` is spawned
@@ -603,12 +603,10 @@ impl App {
     where
         F: FnMut(KeyEvent, &mut String) -> PromptAction<R>,
     {
-        let (_, h) = size()?;
-        let y = h.saturating_sub(1);
         let mut out = stdout();
         let mut input = String::new();
 
-        ui::redraw_prompt(&mut out, label, &input, y)?;
+        ui::redraw_prompt(&mut out, label, &input)?;
 
         loop {
             if let Event::Key(k) = event::read()? {
@@ -620,7 +618,7 @@ impl App {
                     PromptAction::Cancel => return Ok(None),
                     PromptAction::Accept(r) => return Ok(Some(r)),
                 }
-                ui::redraw_prompt(&mut out, label, &input, y)?;
+                ui::redraw_prompt(&mut out, label, &input)?;
             }
         }
     }
