@@ -374,10 +374,17 @@ fn index_width(offset: usize, page_count: usize) -> usize {
     (offset + page_count).to_string().len().max(3)
 }
 
+/// Does `mail`'s title run past the subject column of its row? The question
+/// the marquee tick asks, so the app never has to rebuild the row layout.
+pub fn title_overflows(mail: &Mail, offset: usize, page_count: usize, indented: bool) -> bool {
+    let (cols, _) = size().unwrap_or((80, 24));
+    mail.subject.chars().count() > subject_column_width(cols, offset, page_count, indented)
+}
+
 /// Width of the subject column for a row of the current page. The one place the
-/// row layout is worked out: `queue_list_row` renders against it, and the marquee
-/// tick asks it whether a title overflows without re-rendering.
-pub fn subject_column_width(cols: u16, offset: usize, page_count: usize, indented: bool) -> usize {
+/// row layout is worked out: `queue_list_row` renders against it, and
+/// `title_overflows` asks it whether a title fits without re-rendering.
+fn subject_column_width(cols: u16, offset: usize, page_count: usize, indented: bool) -> usize {
     // prefix is " [<idx>] <date>  ": 2 + idx_w + 2 + DATE_W + 2 chars.
     let prefix_w = 6 + index_width(offset, page_count) + DATE_W;
     let indent_w = if indented { INDENT.chars().count() } else { 0 };

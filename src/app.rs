@@ -123,15 +123,13 @@ impl App {
         let Some(mail) = self.pages.selected_mail() else {
             return false;
         };
-        let (cols, _) = size().unwrap_or((80, 24));
         let page = self.pages.current();
-        let subject_w = ui::subject_column_width(
-            cols,
+        if !ui::title_overflows(
+            mail,
             page.offset,
             page.mails.len(),
             page.indent[self.pages.selected()],
-        );
-        if mail.subject.chars().count() <= subject_w {
+        ) {
             if self.selected_title_scroll != 0 {
                 self.selected_title_scroll = 0;
                 return true;
