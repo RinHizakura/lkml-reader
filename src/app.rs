@@ -47,6 +47,10 @@ pub struct App {
     pages: Pages,
 
     view: View,
+    /// One-shot message drawn on the bottom line over whatever view is up:
+    /// errors and end-of-stream notes. The next key clears it and still acts,
+    /// so a notice never swallows input or changes the view.
+    notice: Option<String>,
     detail_text: String,
     detail_scroll: usize,
 
@@ -82,6 +86,17 @@ fn expand_tilde(path: &str) -> String {
     }
 }
 
+/// Prompt the user to confirm cloning `epoch`. Returns whether they agreed.
+fn prompt_clone(tui: &mut Tui, list: &str, epoch: u32) -> Result<bool> {
+    let label = format!("Clone {list} epoch {epoch}? [y/N]: ");
+    Ok(tui
+        .prompt(&label, |k, _| match k.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => PromptAction::Accept(()),
+            _ => PromptAction::Cancel,
+        })?
+        .is_some())
+}
+
 impl App {
     pub fn new(list_name: String) -> Self {
         let source = MailSource::Stream(StreamSource::new(list_name.clone(), Vec::new()));
@@ -94,6 +109,7 @@ impl App {
             source,
             pages: Pages::new(page_size_for_terminal()),
             view: View::Loading("Starting…".to_string()),
+            notice: None,
             detail_text: String::new(),
             detail_scroll: 0,
             repo_path: std::env::current_dir()
@@ -249,21 +265,22 @@ impl App {
     /// while the source is still working on it.
     fn resolve_page(&mut self, target: usize, tui: &mut Tui) -> Result<()> {
         self.pages.begin(target);
-        // The source is moved out for the call so the consent adapter may
-        // borrow the rest of the app to prompt and paint.
-        let mut source = std::mem::replace(&mut self.source, App::empty_source());
-        let state = source.page(target, self.pages.page_size(), &mut |epoch| {
-            if !self.prompt_clone(tui, epoch)? {
-                return Ok(false);
-            }
-            self.view = View::Loading(format!(
-                "Cloning {} epoch {} (this may take a while)…",
-                self.list_name, epoch
-            ));
-            self.render(tui)?;
-            Ok(true)
-        });
-        self.source = source;
+        // The consent adapter only needs the terminal and the list name, so
+        // the source stays in place while it borrows neither.
+        let list = self.list_name.clone();
+        let state = self
+            .source
+            .page(target, self.pages.page_size(), &mut |epoch| {
+                if !prompt_clone(tui, &list, epoch)? {
+                    return Ok(false);
+                }
+                ui::redraw_prompt(
+                    tui.out(),
+                    &format!("Cloning {list} epoch {epoch} (this may take a while)…"),
+                    "",
+                )?;
+                Ok(true)
+            });
         match state? {
             PageState::Ready(page) => {
                 self.pages.accept(page);
@@ -273,27 +290,17 @@ impl App {
                 self.view = View::Loading(message);
                 return Ok(());
             }
-            PageState::End => {}
+            PageState::End => {
+                // Page 0 empty is already explained by the list's empty
+                // message; past it, say why nothing changed.
+                if target > 0 {
+                    self.notice = Some("No more mails.".to_string());
+                }
+            }
         }
         self.pages.settle();
         self.view = View::List;
         Ok(())
-    }
-
-    /// A stand-in source with nothing in it, for `resolve_page`'s swap.
-    fn empty_source() -> MailSource {
-        MailSource::Stream(StreamSource::new(String::new(), Vec::new()))
-    }
-
-    /// Prompt the user to confirm cloning `epoch`. Returns whether they agreed.
-    fn prompt_clone(&self, tui: &mut Tui, epoch: u32) -> Result<bool> {
-        let label = format!("Clone {} epoch {}? [y/N]: ", self.list_name, epoch);
-        Ok(tui
-            .prompt(&label, |k, _| match k.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => PromptAction::Accept(()),
-                _ => PromptAction::Cancel,
-            })?
-            .is_some())
     }
 
     fn open_selected(&mut self) -> Result<()> {
@@ -313,7 +320,7 @@ impl App {
             return Ok(());
         };
         if let Err(e) = tui.suspended(|| reply::compose_and_send(&draft)) {
-            self.view = View::Loading(format!("Reply not sent: {e}"));
+            self.notice = Some(format!("Reply not sent: {e}"));
         }
         Ok(())
     }
@@ -325,9 +332,7 @@ impl App {
             return Ok(());
         };
         if mail.patch_tag.is_none() {
-            tui.prompt::<_, ()>("Not a patch mail. Press any key.", |_, _| {
-                PromptAction::Cancel
-            })?;
+            self.notice = Some("Not a patch mail.".to_string());
             return Ok(());
         }
         let label = format!("Apply series to git repo [{}]: ", self.repo_path);
@@ -352,7 +357,7 @@ impl App {
             thread::patch_series(&list, &mail).and_then(|series| patch::apply(&target, &series))
         });
         if let Err(e) = outcome {
-            self.view = View::Loading(format!("Not applied: {e}"));
+            self.notice = Some(format!("Not applied: {e}"));
         }
         Ok(())
     }
@@ -367,7 +372,11 @@ impl App {
             View::List => ui::draw_list(out, &self.list_view(header, &self.empty_message())),
             View::Detail => ui::draw_detail(out, &header, &self.detail_text, self.detail_scroll),
             View::Help => ui::draw_help(out, &header),
+        }?;
+        if let Some(notice) = &self.notice {
+            ui::draw_notice(tui.out(), notice)?;
         }
+        Ok(())
     }
 
     /// Redraw only the selected row, used for marquee ticks. Avoids the full
@@ -487,6 +496,7 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
             return Ok(true);
         }
+        self.notice = None;
         match self.view {
             View::List => match key.code {
                 KeyCode::Char('q') => return Ok(true),
@@ -542,7 +552,7 @@ impl App {
                                 let _ = self.apply_filter(tui);
                             }
                             Err(e) => {
-                                self.view = View::Loading(format!("Invalid date filter: {e}"));
+                                self.notice = Some(format!("Invalid date filter: {e}"));
                             }
                         }
                     }
@@ -588,7 +598,14 @@ impl App {
                 _ => {}
             },
             View::Help => self.view = View::List,
-            View::Loading(_) => self.view = View::List,
+            // A loading screen only stays up while a scan is pending, and the
+            // poll tick repaints it — dismissing it goes nowhere, but quitting
+            // must still work.
+            View::Loading(_) => {
+                if key.code == KeyCode::Char('q') {
+                    return Ok(true);
+                }
+            }
         }
         Ok(false)
     }

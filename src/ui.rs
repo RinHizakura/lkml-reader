@@ -130,6 +130,22 @@ pub fn redraw_prompt<W: Write>(out: &mut W, label: &str, input: &str) -> Result<
     Ok(())
 }
 
+/// A one-shot message over the hotkey line, styled apart from it so errors and
+/// end-of-stream notes read as news, not as hints. The next full draw wipes it.
+pub fn draw_notice<W: Write>(out: &mut W, message: &str) -> Result<()> {
+    let (cols, rows) = size()?;
+    execute!(
+        out,
+        MoveTo(0, rows.saturating_sub(1)),
+        SetBackgroundColor(Color::DarkYellow),
+        SetForegroundColor(Color::Black),
+        Print(pad_or_truncate(&format!(" {message}"), cols as usize)),
+        ResetColor,
+    )?;
+    out.flush()?;
+    Ok(())
+}
+
 fn draw_header<W: Write>(out: &mut W, h: &HeaderInfo, cols: u16) -> Result<()> {
     let title = format!(
         " LKML Reader  —  list: {}   epoch: {}   page: {}   subject: {}   author: {}   date: {}",
