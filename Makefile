@@ -15,6 +15,9 @@ uninstall:
 run-reader: build
 	./target/release/lkml-reader -l $(LIST)
 
+test:
+	cargo test
+
 clean:
 	cargo clean
 
