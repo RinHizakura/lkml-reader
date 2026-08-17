@@ -5,13 +5,14 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use std::time::{Duration, Instant};
 
 use lkml_core::archive;
+use lkml_core::mail::Mail;
 use lkml_core::thread;
 
 use crate::pages::Pages;
 use crate::patch;
 use crate::reply;
 use crate::source::{Constraint, FilterSet, FilteredSource, MailSource, PageState, StreamSource};
-use crate::tui::{PromptAction, Tui};
+use crate::tui::Tui;
 use crate::ui;
 
 enum View {
@@ -19,6 +20,15 @@ enum View {
     List,
     Detail,
     Help,
+}
+
+/// What the open bottom-line prompt is asking for. A prompt is a mode of the
+/// main loop, not a nested loop of its own: while one is up, the scan worker
+/// keeps being drained, resizes keep re-laying-out, and repaints keep landing.
+enum Prompt {
+    Filter(Constraint),
+    /// Apply this mail's series once a target repo is answered.
+    ApplyRepo(Mail),
 }
 
 pub struct App {
@@ -48,6 +58,8 @@ pub struct App {
     /// errors and end-of-stream notes. The next key clears it and still acts,
     /// so a notice never swallows input or changes the view.
     notice: Option<String>,
+    /// The open bottom-line prompt, if any: what it asks plus the input so far.
+    prompt: Option<(Prompt, String)>,
     detail_text: String,
     detail_scroll: usize,
 
@@ -83,17 +95,6 @@ fn expand_tilde(path: &str) -> String {
     }
 }
 
-/// Prompt the user to confirm cloning `epoch`. Returns whether they agreed.
-fn prompt_clone(tui: &mut Tui, list: &str, epoch: u32) -> Result<bool> {
-    let label = format!("Clone {list} epoch {epoch}? [y/N]: ");
-    Ok(tui
-        .prompt(&label, |k, _| match k.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => PromptAction::Accept(()),
-            _ => PromptAction::Cancel,
-        })?
-        .is_some())
-}
-
 impl App {
     pub fn new(list_name: String) -> Self {
         let source = MailSource::Stream(StreamSource::new(list_name.clone(), Vec::new()));
@@ -107,6 +108,7 @@ impl App {
             pages: Pages::new(page_size_for_terminal()),
             view: View::Loading("Starting…".to_string()),
             notice: None,
+            prompt: None,
             detail_text: String::new(),
             detail_scroll: 0,
             repo_path: std::env::current_dir()
@@ -227,18 +229,53 @@ impl App {
         }
     }
 
-    /// Prompt for one filter constraint and re-run filtering on a valid
-    /// answer. One flow serves all three keys — the labels, the setters and
-    /// the only parse that can fail all live in `FilterSet`.
-    fn edit_filter(&mut self, tui: &mut Tui, which: Constraint) -> Result<()> {
-        let label = self.filters.prompt_label(which);
-        if let Some(answer) = tui.prompt_line(&label)? {
-            match self.filters.set(which, &answer) {
+    /// Open the bottom-line prompt; `finish_prompt` acts on the answer.
+    fn open_prompt(&mut self, kind: Prompt) {
+        self.prompt = Some((kind, String::new()));
+    }
+
+    /// The label for the open prompt, current defaults included. Computed at
+    /// draw time, so it always shows the current value.
+    fn prompt_label(&self, kind: &Prompt) -> String {
+        match kind {
+            Prompt::Filter(which) => self.filters.prompt_label(*which),
+            Prompt::ApplyRepo(_) => format!("Apply series to git repo [{}]: ", self.repo_path),
+        }
+    }
+
+    /// One key for the open prompt: Enter answers, Esc or Ctrl-C cancels,
+    /// Backspace and printable characters edit.
+    fn handle_prompt_key(&mut self, tui: &mut Tui, key: KeyEvent) -> Result<()> {
+        let Some((kind, mut input)) = self.prompt.take() else {
+            return Ok(());
+        };
+        match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {}
+            KeyCode::Enter => return self.finish_prompt(tui, kind, input),
+            KeyCode::Backspace => {
+                input.pop();
+                self.prompt = Some((kind, input));
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                input.push(c);
+                self.prompt = Some((kind, input));
+            }
+            _ => self.prompt = Some((kind, input)),
+        }
+        Ok(())
+    }
+
+    /// Act on an answered prompt.
+    fn finish_prompt(&mut self, tui: &mut Tui, kind: Prompt, answer: String) -> Result<()> {
+        match kind {
+            Prompt::Filter(which) => match self.filters.set(which, &answer) {
                 Ok(()) => {
                     let _ = self.apply_filter(tui);
                 }
                 Err(e) => self.notice = Some(e.to_string()),
-            }
+            },
+            Prompt::ApplyRepo(mail) => self.apply_series(tui, mail, answer.trim())?,
         }
         Ok(())
     }
@@ -284,7 +321,7 @@ impl App {
         let state = self
             .source
             .page(target, self.pages.page_size(), &mut |epoch| {
-                if !prompt_clone(tui, &list, epoch)? {
+                if !tui.confirm(&format!("Clone {list} epoch {epoch}? [y/N]: "))? {
                     return Ok(false);
                 }
                 ui::redraw_prompt(
@@ -340,21 +377,22 @@ impl App {
         Ok(())
     }
 
-    /// Prompt for the target repo, then apply the selected mail's whole patch
-    /// series with `git am`, with git owning the terminal while it runs.
-    fn apply_patch(&mut self, tui: &mut Tui) -> Result<()> {
+    /// Ask where the selected mail's patch series should apply; the series
+    /// runs through `apply_series` once the repo is answered.
+    fn apply_patch(&mut self) {
         let Some(mail) = self.pages.selected_mail().cloned() else {
-            return Ok(());
+            return;
         };
         if mail.patch_tag.is_none() {
             self.notice = Some("Not a patch mail.".to_string());
-            return Ok(());
+            return;
         }
-        let label = format!("Apply series to git repo [{}]: ", self.repo_path);
-        let Some(answer) = tui.prompt_line(&label)? else {
-            return Ok(());
-        };
-        let answer = answer.trim();
+        self.open_prompt(Prompt::ApplyRepo(mail));
+    }
+
+    /// Apply `mail`'s whole patch series with `git am` to the answered repo
+    /// path, with git owning the terminal while it runs.
+    fn apply_series(&mut self, tui: &mut Tui, mail: Mail, answer: &str) -> Result<()> {
         let target = if answer.is_empty() {
             self.repo_path.clone()
         } else {
@@ -394,6 +432,9 @@ impl App {
         }?;
         if let Some(notice) = &self.notice {
             ui::draw_notice(tui.out(), size, notice)?;
+        }
+        if let Some((kind, input)) = &self.prompt {
+            ui::redraw_prompt(tui.out(), size, &self.prompt_label(kind), input)?;
         }
         Ok(())
     }
@@ -492,7 +533,9 @@ impl App {
             if self.poll_source(tui)? {
                 self.render(tui)?;
             }
-            if self.tick_title_scroll() {
+            // The marquee pauses while a prompt is up: its row redraw would
+            // hide the cursor mid-typing.
+            if self.prompt.is_none() && self.tick_title_scroll() {
                 self.render_selected_title(tui)?;
             }
             if event::poll(Duration::from_millis(250))? {
@@ -519,10 +562,16 @@ impl App {
     }
 
     fn handle_key(&mut self, tui: &mut Tui, key: KeyEvent) -> Result<bool> {
+        self.notice = None;
+        // An open prompt owns the keyboard — including Ctrl-C, which cancels
+        // the prompt rather than the app.
+        if self.prompt.is_some() {
+            self.handle_prompt_key(tui, key)?;
+            return Ok(false);
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
             return Ok(true);
         }
-        self.notice = None;
         match self.view {
             View::List => match key.code {
                 KeyCode::Char('q') => return Ok(true),
@@ -546,10 +595,10 @@ impl App {
                     let _ = self.open_selected();
                 }
                 KeyCode::Char('r') => self.reply_selected(tui)?,
-                KeyCode::Char('p') => self.apply_patch(tui)?,
-                KeyCode::Char('/') => self.edit_filter(tui, Constraint::Subject)?,
-                KeyCode::Char('a') => self.edit_filter(tui, Constraint::Author)?,
-                KeyCode::Char('d') => self.edit_filter(tui, Constraint::Date)?,
+                KeyCode::Char('p') => self.apply_patch(),
+                KeyCode::Char('/') => self.open_prompt(Prompt::Filter(Constraint::Subject)),
+                KeyCode::Char('a') => self.open_prompt(Prompt::Filter(Constraint::Author)),
+                KeyCode::Char('d') => self.open_prompt(Prompt::Filter(Constraint::Date)),
                 KeyCode::Char('u') => {
                     self.view = View::Loading(format!(
                         "Updating mirror {} epoch {}…",
@@ -579,7 +628,7 @@ impl App {
                     self.view = View::List;
                 }
                 KeyCode::Char('r') => self.reply_selected(tui)?,
-                KeyCode::Char('p') => self.apply_patch(tui)?,
+                KeyCode::Char('p') => self.apply_patch(),
                 KeyCode::Down => self.detail_scroll = self.detail_scroll.saturating_add(1),
                 KeyCode::Up => self.detail_scroll = self.detail_scroll.saturating_sub(1),
                 KeyCode::PageDown | KeyCode::Char(' ') => {
