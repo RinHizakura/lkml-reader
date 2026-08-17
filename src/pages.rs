@@ -81,37 +81,48 @@ impl Pages {
         0
     }
 
-    /// Begin serving the page at `target`; it stays pending until `settle`.
+    /// The page at `target` is still being worked on; the poll tick retries it.
     pub fn begin(&mut self, target: usize) {
         self.pending = Some(target);
     }
 
-    /// The source served a page: show it from the top.
+    /// The source served a page: nothing is pending anymore, and its start is
+    /// a boundary worth remembering — recorded only now, so a target that was
+    /// never served leaves no phantom behind. A new page shows from the top;
+    /// the current page re-served (a resize's re-cut) keeps the selection,
+    /// clamped to what still exists and scrolled back into view.
     pub fn accept(&mut self, page: Page) {
+        // Offsets ascend, so a boundary we have already crossed is at or
+        // before the end; only a brand new one goes past it.
+        if self.offsets.last() < Some(&page.offset) {
+            self.offsets.push(page.offset);
+        }
+        if page.offset != self.current.offset {
+            self.selected = 0;
+            self.scroll = 0;
+        } else {
+            self.selected = self.selected.min(page.len().saturating_sub(1));
+            self.scroll = self.scroll.min(self.selected);
+            if self.selected + 1 > self.scroll + self.page_size {
+                self.scroll = self.selected + 1 - self.page_size;
+            }
+        }
         self.current = page;
-        self.selected = 0;
-        self.scroll = 0;
+        self.pending = None;
     }
 
-    /// Serving finished (or was given up on); nothing is pending anymore.
+    /// Serving was given up on (the stream ended); nothing is pending anymore.
     pub fn settle(&mut self) {
         self.pending = None;
     }
 
     /// Where the next page starts — only known now that the current one has
-    /// been served — remembering the boundary for the way back. `None` while
-    /// the current page is empty.
-    pub fn next_target(&mut self) -> Option<usize> {
+    /// been served. `None` while the current page is empty.
+    pub fn next_target(&self) -> Option<usize> {
         if self.current.is_empty() {
             return None;
         }
-        let target = self.current.offset + self.current.len();
-        // Offsets ascend, so a boundary we have already crossed is at or
-        // before the end; only a brand new one goes past it.
-        if self.offsets.last() < Some(&target) {
-            self.offsets.push(target);
-        }
-        Some(target)
+        Some(self.current.offset + self.current.len())
     }
 
     /// Where the previous page starts; `None` on the first page.
@@ -187,7 +198,7 @@ mod tests {
 
     #[test]
     fn empty_page_has_no_next() {
-        let mut p = Pages::new(5);
+        let p = Pages::new(5);
         assert_eq!(p.next_target(), None);
     }
 
@@ -208,13 +219,42 @@ mod tests {
     fn resize_forgets_boundaries_cut_for_the_old_height() {
         let mut p = Pages::new(5);
         p.accept(page(0, 5));
-        p.next_target();
         p.accept(page(5, 5));
-        p.next_target(); // boundary at 10, cut for the old height
+        p.accept(page(10, 5)); // visited, so 10 is a recorded boundary
+        p.accept(page(5, 5)); // back one page
         assert_eq!(p.resize(3), 5); // re-serve the current page…
         p.accept(page(5, 3));
         assert_eq!(p.prev_target(), Some(0)); // …the way back survives
         assert_eq!(p.next_target(), Some(8)); // …the way forward is recut
+    }
+
+    #[test]
+    fn unserved_targets_leave_no_boundary() {
+        let mut p = Pages::new(5);
+        p.accept(page(0, 5));
+        let target = p.next_target().unwrap();
+        p.begin(target);
+        assert_eq!(p.pending(), Some(target));
+        p.settle(); // the stream had nothing there
+        assert_eq!(p.pending(), None);
+        // Still page 1 of 1: the failed target recorded nothing.
+        assert_eq!(p.label(), "1");
+        assert_eq!(p.prev_target(), None);
+    }
+
+    #[test]
+    fn reserving_the_same_page_keeps_the_selection_in_view() {
+        let mut p = Pages::new(5);
+        p.accept(page(0, 5));
+        for _ in 0..4 {
+            p.select_next();
+        }
+        let target = p.resize(2);
+        p.accept(page(target, 3)); // re-cut shorter for the new height
+        assert_eq!(p.selected(), 2); // clamped to the last remaining row
+        assert_eq!(p.scroll(), 1); // and scrolled into the 2-row window
+        p.accept(page(3, 5)); // a different page still shows from the top
+        assert_eq!((p.selected(), p.scroll()), (0, 0));
     }
 
     #[test]

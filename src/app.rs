@@ -264,7 +264,6 @@ impl App {
     /// consent prompt (and its progress screen). The page stays pending only
     /// while the source is still working on it.
     fn resolve_page(&mut self, target: usize, tui: &mut Tui) -> Result<()> {
-        self.pages.begin(target);
         // The consent adapter only needs the terminal and the list name, so
         // the source stays in place while it borrows neither.
         let list = self.list_name.clone();
@@ -287,10 +286,12 @@ impl App {
                 self.reset_title_scroll();
             }
             PageState::Pending(message) => {
+                self.pages.begin(target);
                 self.view = View::Loading(message);
                 return Ok(());
             }
             PageState::End => {
+                self.pages.settle();
                 // Page 0 empty is already explained by the list's empty
                 // message; past it, say why nothing changed.
                 if target > 0 {
@@ -298,7 +299,6 @@ impl App {
                 }
             }
         }
-        self.pages.settle();
         self.view = View::List;
         Ok(())
     }
