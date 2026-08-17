@@ -5,7 +5,7 @@
 //! here rather than in the shared `lkml-core` library, which stays about mail
 //! parsing and archive I/O.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -182,15 +182,23 @@ fn is_whole(mails: &[Mail], tag: &SeriesTag) -> bool {
     (1..=tag.total).all(|n| seen.contains(&n))
 }
 
-/// The subject, author and date constraints as one value. What is pushed down
-/// into `git log`, what runs as a Rust-side predicate on the survivors, and
-/// how a scan reports progress all come from here — the one home for the two
-/// representations of "matches".
+/// One of the three filter constraints, for driving the shared prompt flow.
+#[derive(Clone, Copy)]
+pub enum Constraint {
+    Subject,
+    Author,
+    Date,
+}
+
+/// The subject, author and date constraints as one value. What the user is
+/// prompted with, what is pushed down into `git log`, what runs as a
+/// Rust-side predicate on the survivors, and how a scan reports progress all
+/// come from here — the one home for every representation of "matches".
 #[derive(Clone)]
 pub struct FilterSet {
-    pub subject: NameFilter,
-    pub author: NameFilter,
-    pub date: DateFilter,
+    subject: NameFilter,
+    author: NameFilter,
+    date: DateFilter,
 }
 
 impl FilterSet {
@@ -205,6 +213,47 @@ impl FilterSet {
     /// Whether any constraint is set.
     pub fn is_active(&self) -> bool {
         self.subject.is_active() || self.author.is_active() || self.date.is_active()
+    }
+
+    /// The prompt label for editing `which`, current value included.
+    pub fn prompt_label(&self, which: Constraint) -> String {
+        match which {
+            Constraint::Subject => format!(
+                "Filter (subject substring, empty=clear) [{}]: ",
+                self.subject
+            ),
+            Constraint::Author => format!(
+                "Filter (author substring, empty=clear) [{}]: ",
+                self.author
+            ),
+            Constraint::Date => format!(
+                "Filter date (today | yesterday | YYYY/MM/DD HH:MM to YYYY/MM/DD HH:MM, empty=clear) [{}]: ",
+                self.date
+            ),
+        }
+    }
+
+    /// Set `which` from the user's answer (empty clears it). Only the date can
+    /// fail: it is the only constraint with a syntax to get wrong.
+    pub fn set(&mut self, which: Constraint, answer: &str) -> Result<()> {
+        match which {
+            Constraint::Subject => self.subject.set(answer),
+            Constraint::Author => self.author.set(answer),
+            Constraint::Date => self
+                .date
+                .set(answer)
+                .map_err(|e| anyhow!("Invalid date filter: {e}"))?,
+        }
+        Ok(())
+    }
+
+    /// The constraints as header-ready display strings: subject, author, date.
+    pub fn labels(&self) -> [String; 3] {
+        [
+            self.subject.to_string(),
+            self.author.to_string(),
+            self.date.to_string(),
+        ]
     }
 
     /// The needles `git log` narrows an epoch by: (subject, author).

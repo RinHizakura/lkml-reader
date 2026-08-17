@@ -11,17 +11,18 @@ use crossterm::{
 };
 use std::io::Write;
 
-use lkml_core::filter::{DateFilter, NameFilter};
 use lkml_core::mail::Mail;
 
+/// Everything the header bar shows, already formatted — the ui takes display
+/// strings, not filter types, so it never has to know what a filter is.
 #[derive(Clone, Copy)]
 pub struct HeaderInfo<'a> {
     pub list_name: &'a str,
     pub epoch_label: &'a str,
     pub page_label: &'a str,
-    pub subject_filter: &'a NameFilter,
-    pub author_filter: &'a NameFilter,
-    pub date_filter: &'a DateFilter,
+    pub subject_filter: &'a str,
+    pub author_filter: &'a str,
+    pub date_filter: &'a str,
 }
 
 pub struct ListView<'a> {
@@ -498,16 +499,13 @@ mod tests {
     fn draws_headless_to_a_buffer() {
         // Size comes in as a parameter, so a full frame renders into plain
         // bytes with no terminal behind it.
-        let subject = NameFilter::subject();
-        let author = NameFilter::author();
-        let date = DateFilter::new();
         let header = HeaderInfo {
             list_name: "lkml",
             epoch_label: "-",
             page_label: "1",
-            subject_filter: &subject,
-            author_filter: &author,
-            date_filter: &date,
+            subject_filter: "-",
+            author_filter: "-",
+            date_filter: "-",
         };
         let mut out: Vec<u8> = Vec::new();
         draw_loading(&mut out, (80, 24), &header, "Fetching…").unwrap();

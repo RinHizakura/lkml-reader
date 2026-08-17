@@ -10,7 +10,7 @@ use lkml_core::thread;
 use crate::pages::Pages;
 use crate::patch;
 use crate::reply;
-use crate::source::{FilterSet, FilteredSource, MailSource, PageState, StreamSource};
+use crate::source::{Constraint, FilterSet, FilteredSource, MailSource, PageState, StreamSource};
 use crate::tui::{PromptAction, Tui};
 use crate::ui;
 
@@ -227,6 +227,22 @@ impl App {
         }
     }
 
+    /// Prompt for one filter constraint and re-run filtering on a valid
+    /// answer. One flow serves all three keys — the labels, the setters and
+    /// the only parse that can fail all live in `FilterSet`.
+    fn edit_filter(&mut self, tui: &mut Tui, which: Constraint) -> Result<()> {
+        let label = self.filters.prompt_label(which);
+        if let Some(answer) = tui.prompt_line(&label)? {
+            match self.filters.set(which, &answer) {
+                Ok(()) => {
+                    let _ = self.apply_filter(tui);
+                }
+                Err(e) => self.notice = Some(e.to_string()),
+            }
+        }
+        Ok(())
+    }
+
     /// (Re)start filtering from the current constraints. When none is active,
     /// drop any running job and fall back to the unfiltered stream.
     fn apply_filter(&mut self, tui: &mut Tui) -> Result<()> {
@@ -364,7 +380,8 @@ impl App {
     /// Dispatch to the per-view renderer based on `self.view`.
     fn render(&self, tui: &mut Tui) -> Result<()> {
         let (epoch_label, page_label) = (self.epoch_label(), self.pages.label());
-        let header = self.header_info(&epoch_label, &page_label);
+        let filters = self.filters.labels();
+        let header = self.header_info(&epoch_label, &page_label, &filters);
         let size = Tui::size();
         let out = tui.out();
         match &self.view {
@@ -389,7 +406,8 @@ impl App {
             return Ok(());
         }
         let (epoch_label, page_label) = (self.epoch_label(), self.pages.label());
-        let header = self.header_info(&epoch_label, &page_label);
+        let filters = self.filters.labels();
+        let header = self.header_info(&epoch_label, &page_label, &filters);
         ui::redraw_selected_row(tui.out(), Tui::size(), &self.list_view(header, &[]))
     }
 
@@ -427,14 +445,20 @@ impl App {
         }
     }
 
-    fn header_info<'a>(&'a self, epoch_label: &'a str, page_label: &'a str) -> ui::HeaderInfo<'a> {
+    fn header_info<'a>(
+        &'a self,
+        epoch_label: &'a str,
+        page_label: &'a str,
+        filters: &'a [String; 3],
+    ) -> ui::HeaderInfo<'a> {
+        let [subject, author, date] = filters;
         ui::HeaderInfo {
             list_name: &self.list_name,
             epoch_label,
             page_label,
-            subject_filter: &self.filters.subject,
-            author_filter: &self.filters.author,
-            date_filter: &self.filters.date,
+            subject_filter: subject,
+            author_filter: author,
+            date_filter: date,
         }
     }
 
@@ -523,42 +547,9 @@ impl App {
                 }
                 KeyCode::Char('r') => self.reply_selected(tui)?,
                 KeyCode::Char('p') => self.apply_patch(tui)?,
-                KeyCode::Char('/') => {
-                    let label = format!(
-                        "Filter (subject substring, empty=clear) [{}]: ",
-                        self.filters.subject
-                    );
-                    if let Some(s) = tui.prompt_line(&label)? {
-                        self.filters.subject.set(&s);
-                        let _ = self.apply_filter(tui);
-                    }
-                }
-                KeyCode::Char('a') => {
-                    let label = format!(
-                        "Filter (author substring, empty=clear) [{}]: ",
-                        self.filters.author
-                    );
-                    if let Some(s) = tui.prompt_line(&label)? {
-                        self.filters.author.set(&s);
-                        let _ = self.apply_filter(tui);
-                    }
-                }
-                KeyCode::Char('d') => {
-                    let label = format!(
-                        "Filter date (today | yesterday | YYYY/MM/DD HH:MM to YYYY/MM/DD HH:MM, empty=clear) [{}]: ",
-                        self.filters.date
-                    );
-                    if let Some(s) = tui.prompt_line(&label)? {
-                        match self.filters.date.set(&s) {
-                            Ok(()) => {
-                                let _ = self.apply_filter(tui);
-                            }
-                            Err(e) => {
-                                self.notice = Some(format!("Invalid date filter: {e}"));
-                            }
-                        }
-                    }
-                }
+                KeyCode::Char('/') => self.edit_filter(tui, Constraint::Subject)?,
+                KeyCode::Char('a') => self.edit_filter(tui, Constraint::Author)?,
+                KeyCode::Char('d') => self.edit_filter(tui, Constraint::Date)?,
                 KeyCode::Char('u') => {
                     self.view = View::Loading(format!(
                         "Updating mirror {} epoch {}…",
