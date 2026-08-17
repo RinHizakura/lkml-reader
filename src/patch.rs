@@ -7,12 +7,12 @@
 //! this module only runs git and talks to the terminal.
 
 use anyhow::{bail, Context, Result};
-use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 
+use crate::tui;
 use lkml_core::mail::Mail;
 
 /// A scratch directory that deletes itself on drop.
@@ -66,7 +66,7 @@ pub fn apply(repo: &str, patches: &[Mail]) -> Result<()> {
             "\nWarning: the series says {expected} patches, but only {} were found in the mirror.",
             patches.len()
         );
-        if !confirm("Apply the incomplete series anyway? [y/N]: ")? {
+        if !tui::confirm_line("Apply the incomplete series anyway? [y/N]: ")? {
             bail!("aborted");
         }
     }
@@ -99,12 +99,4 @@ pub fn is_git_repo(repo: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
-}
-
-fn confirm(prompt: &str) -> Result<bool> {
-    print!("{prompt}");
-    std::io::stdout().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().lock().read_line(&mut answer)?;
-    Ok(matches!(answer.trim(), "y" | "Y"))
 }

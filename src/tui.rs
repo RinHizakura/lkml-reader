@@ -82,6 +82,17 @@ impl Drop for Tui {
     }
 }
 
+/// Ask a yes/no question on the plain terminal, answered with a typed line —
+/// the suspended-mode sibling of [`Tui::confirm`], for code running inside
+/// [`Tui::suspended`] where raw mode is off and stdin is line-buffered.
+pub fn confirm_line(prompt: &str) -> Result<bool> {
+    print!("{prompt}");
+    stdout().flush()?;
+    let mut answer = String::new();
+    stdin().lock().read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y"))
+}
+
 /// Wait for the user to press Enter before the TUI paints back over whatever a
 /// child process left on the plain terminal.
 fn pause() {
