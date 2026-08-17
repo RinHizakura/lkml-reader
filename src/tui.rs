@@ -40,6 +40,14 @@ impl Tui {
         &mut self.out
     }
 
+    /// The terminal size, with a sane default when it cannot be read. The one
+    /// place the screen is measured — every layout question starts here, and
+    /// the draw functions take the answer as a parameter so they never have to
+    /// touch a real terminal.
+    pub fn size() -> (u16, u16) {
+        crossterm::terminal::size().unwrap_or((80, 24))
+    }
+
     /// Run `f` with the TUI suspended so a child process (`$EDITOR`, `git`)
     /// owns the plain terminal, wait for acknowledgement, then restore the
     /// alternate screen — however `f` returned.
@@ -64,7 +72,7 @@ impl Tui {
         F: FnMut(KeyEvent, &mut String) -> PromptAction<R>,
     {
         let mut input = String::new();
-        ui::redraw_prompt(&mut self.out, label, &input)?;
+        ui::redraw_prompt(&mut self.out, Self::size(), label, &input)?;
 
         loop {
             if let Event::Key(k) = event::read()? {
@@ -82,7 +90,7 @@ impl Tui {
                     PromptAction::Cancel => return Ok(None),
                     PromptAction::Accept(r) => return Ok(Some(r)),
                 }
-                ui::redraw_prompt(&mut self.out, label, &input)?;
+                ui::redraw_prompt(&mut self.out, Self::size(), label, &input)?;
             }
         }
     }

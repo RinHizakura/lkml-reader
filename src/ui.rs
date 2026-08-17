@@ -7,7 +7,7 @@ use crossterm::{
     style::{
         Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
     },
-    terminal::{size, Clear, ClearType},
+    terminal::{Clear, ClearType},
 };
 use std::io::Write;
 
@@ -59,11 +59,17 @@ const AUTHOR_W: usize = 24;
 /// `body` is handed the width and the content row count, and is skipped
 /// outright on a window too short to have any — so no body has to guard
 /// against that itself.
-fn draw_frame<W: Write, F>(out: &mut W, header: &HeaderInfo, hint: &str, body: F) -> Result<()>
+fn draw_frame<W: Write, F>(
+    out: &mut W,
+    size: (u16, u16),
+    header: &HeaderInfo,
+    hint: &str,
+    body: F,
+) -> Result<()>
 where
     F: FnOnce(&mut W, u16, usize) -> Result<()>,
 {
-    let (cols, rows) = size()?;
+    let (cols, rows) = size;
     let visible = content_rows(rows);
     queue!(out, Hide, Clear(ClearType::All))?;
     draw_header(out, header, cols)?;
@@ -75,15 +81,21 @@ where
     Ok(())
 }
 
-pub fn draw_loading<W: Write>(out: &mut W, header: &HeaderInfo, message: &str) -> Result<()> {
-    draw_frame(out, header, "", |out, cols, visible| {
+pub fn draw_loading<W: Write>(
+    out: &mut W,
+    size: (u16, u16),
+    header: &HeaderInfo,
+    message: &str,
+) -> Result<()> {
+    draw_frame(out, size, header, "", |out, cols, visible| {
         draw_centered(out, &format!("⏳  {message}"), cols, visible)
     })
 }
 
-pub fn draw_list<W: Write>(out: &mut W, view: &ListView) -> Result<()> {
+pub fn draw_list<W: Write>(out: &mut W, size: (u16, u16), view: &ListView) -> Result<()> {
     draw_frame(
         out,
+        size,
         &view.header,
         "↑/↓ select  ←/→ page  Enter view  r reply  p apply  / subject  a author  d date  u update  ? help  q quit",
         |out, cols, visible| draw_list_body(out, view, cols, visible),
@@ -92,24 +104,31 @@ pub fn draw_list<W: Write>(out: &mut W, view: &ListView) -> Result<()> {
 
 pub fn draw_detail<W: Write>(
     out: &mut W,
+    size: (u16, u16),
     header: &HeaderInfo,
     text: &str,
     scroll: usize,
 ) -> Result<()> {
     draw_frame(
         out,
+        size,
         header,
         "↑/↓/PgUp/PgDn scroll  g/G top/bottom  r reply  p apply  Esc/q back",
         |out, cols, visible| draw_detail_body(out, text, scroll, cols, visible),
     )
 }
 
-pub fn draw_help<W: Write>(out: &mut W, header: &HeaderInfo) -> Result<()> {
-    draw_frame(out, header, "press any key to return", draw_help_body)
+pub fn draw_help<W: Write>(out: &mut W, size: (u16, u16), header: &HeaderInfo) -> Result<()> {
+    draw_frame(out, size, header, "press any key to return", draw_help_body)
 }
 
-pub fn redraw_prompt<W: Write>(out: &mut W, label: &str, input: &str) -> Result<()> {
-    let (cols, rows) = size()?;
+pub fn redraw_prompt<W: Write>(
+    out: &mut W,
+    size: (u16, u16),
+    label: &str,
+    input: &str,
+) -> Result<()> {
+    let (cols, rows) = size;
     let y = rows.saturating_sub(1);
     let max_w = (cols as usize).saturating_sub(1);
     let combined = format!("{}{}", label, input);
@@ -132,8 +151,8 @@ pub fn redraw_prompt<W: Write>(out: &mut W, label: &str, input: &str) -> Result<
 
 /// A one-shot message over the hotkey line, styled apart from it so errors and
 /// end-of-stream notes read as news, not as hints. The next full draw wipes it.
-pub fn draw_notice<W: Write>(out: &mut W, message: &str) -> Result<()> {
-    let (cols, rows) = size()?;
+pub fn draw_notice<W: Write>(out: &mut W, size: (u16, u16), message: &str) -> Result<()> {
+    let (cols, rows) = size;
     execute!(
         out,
         MoveTo(0, rows.saturating_sub(1)),
@@ -256,8 +275,8 @@ fn queue_list_row<W: Write>(
 /// Redraw only the selected row in-place. Used by the marquee tick to update
 /// the scrolling title without clearing the screen (which would flicker at
 /// the tick rate).
-pub fn redraw_selected_row<W: Write>(out: &mut W, view: &ListView) -> Result<()> {
-    let (cols, rows) = size()?;
+pub fn redraw_selected_row<W: Write>(out: &mut W, size: (u16, u16), view: &ListView) -> Result<()> {
+    let (cols, rows) = size;
     if content_rows(rows) == 0 || view.selected >= view.mails.len() || view.selected < view.scroll {
         return Ok(());
     }
@@ -392,8 +411,13 @@ fn index_width(offset: usize, page_count: usize) -> usize {
 
 /// Does `mail`'s title run past the subject column of its row? The question
 /// the marquee tick asks, so the app never has to rebuild the row layout.
-pub fn title_overflows(mail: &Mail, offset: usize, page_count: usize, indented: bool) -> bool {
-    let (cols, _) = size().unwrap_or((80, 24));
+pub fn title_overflows(
+    cols: u16,
+    mail: &Mail,
+    offset: usize,
+    page_count: usize,
+    indented: bool,
+) -> bool {
     mail.subject.chars().count() > subject_column_width(cols, offset, page_count, indented)
 }
 
@@ -468,6 +492,28 @@ mod tests {
         assert_eq!(pad_or_truncate("日本語", 5), "日本語  ");
         assert_eq!(pad_or_truncate("日本語", 2), "日本");
         assert_eq!(pad_or_truncate("ab", 4), "ab  ");
+    }
+
+    #[test]
+    fn draws_headless_to_a_buffer() {
+        // Size comes in as a parameter, so a full frame renders into plain
+        // bytes with no terminal behind it.
+        let subject = NameFilter::subject();
+        let author = NameFilter::author();
+        let date = DateFilter::new();
+        let header = HeaderInfo {
+            list_name: "lkml",
+            epoch_label: "-",
+            page_label: "1",
+            subject_filter: &subject,
+            author_filter: &author,
+            date_filter: &date,
+        };
+        let mut out: Vec<u8> = Vec::new();
+        draw_loading(&mut out, (80, 24), &header, "Fetching…").unwrap();
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("Fetching…"));
+        assert!(s.contains("lkml"));
     }
 
     #[test]

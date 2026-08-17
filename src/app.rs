@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 
 use anyhow::Result;
-use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
-    terminal::size,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::time::{Duration, Instant};
 
 use lkml_core::archive;
@@ -68,7 +65,7 @@ pub struct App {
 /// Rows a page fills — whatever the ui's content area can show. Floored at 1
 /// so a degenerate window never asks the source for empty pages.
 fn page_size_for_terminal() -> usize {
-    let (_, rows) = size().unwrap_or((80, 24));
+    let (_, rows) = Tui::size();
     ui::content_rows(rows).max(1)
 }
 
@@ -136,6 +133,7 @@ impl App {
         };
         let page = self.pages.current();
         if !ui::title_overflows(
+            Tui::size().0,
             mail,
             page.offset,
             page.mails.len(),
@@ -275,6 +273,7 @@ impl App {
                 }
                 ui::redraw_prompt(
                     tui.out(),
+                    Tui::size(),
                     &format!("Cloning {list} epoch {epoch} (this may take a while)…"),
                     "",
                 )?;
@@ -366,15 +365,18 @@ impl App {
     fn render(&self, tui: &mut Tui) -> Result<()> {
         let (epoch_label, page_label) = (self.epoch_label(), self.pages.label());
         let header = self.header_info(&epoch_label, &page_label);
+        let size = Tui::size();
         let out = tui.out();
         match &self.view {
-            View::Loading(msg) => ui::draw_loading(out, &header, msg),
-            View::List => ui::draw_list(out, &self.list_view(header, &self.empty_message())),
-            View::Detail => ui::draw_detail(out, &header, &self.detail_text, self.detail_scroll),
-            View::Help => ui::draw_help(out, &header),
+            View::Loading(msg) => ui::draw_loading(out, size, &header, msg),
+            View::List => ui::draw_list(out, size, &self.list_view(header, &self.empty_message())),
+            View::Detail => {
+                ui::draw_detail(out, size, &header, &self.detail_text, self.detail_scroll)
+            }
+            View::Help => ui::draw_help(out, size, &header),
         }?;
         if let Some(notice) = &self.notice {
-            ui::draw_notice(tui.out(), notice)?;
+            ui::draw_notice(tui.out(), size, notice)?;
         }
         Ok(())
     }
@@ -388,7 +390,7 @@ impl App {
         }
         let (epoch_label, page_label) = (self.epoch_label(), self.pages.label());
         let header = self.header_info(&epoch_label, &page_label);
-        ui::redraw_selected_row(tui.out(), &self.list_view(header, &[]))
+        ui::redraw_selected_row(tui.out(), Tui::size(), &self.list_view(header, &[]))
     }
 
     /// What to say instead of rows when the page has none.
