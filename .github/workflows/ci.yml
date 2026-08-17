@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # lkml-core is vendored as a submodule; checkout rewrites its
+          # ssh URL to authenticated https, so no key is needed.
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The same check the pre-commit hook runs locally.
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Build
+        run: cargo build
+      - name: Unit tests
+        run: cargo test
