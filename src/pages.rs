@@ -157,3 +157,89 @@ impl Pages {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page(offset: usize, len: usize) -> Page {
+        Page::flat(vec![Mail::default(); len], offset)
+    }
+
+    #[test]
+    fn boundaries_are_remembered_and_never_duplicated() {
+        let mut p = Pages::new(5);
+        p.accept(page(0, 5));
+        assert_eq!(p.next_target(), Some(5));
+        p.accept(page(5, 7)); // grew past page_size to finish a series
+        assert_eq!(p.label(), "2");
+        assert_eq!(p.next_target(), Some(12));
+        p.accept(page(12, 5));
+        assert_eq!(p.prev_target(), Some(5));
+        p.accept(page(5, 7));
+        // Crossing a known boundary again must not record it twice.
+        assert_eq!(p.next_target(), Some(12));
+        assert_eq!(p.prev_target(), Some(0));
+        p.accept(page(0, 5));
+        assert_eq!(p.prev_target(), None);
+        assert_eq!(p.label(), "1");
+    }
+
+    #[test]
+    fn empty_page_has_no_next() {
+        let mut p = Pages::new(5);
+        assert_eq!(p.next_target(), None);
+    }
+
+    #[test]
+    fn reset_starts_over_at_page_zero() {
+        let mut p = Pages::new(5);
+        p.accept(page(0, 5));
+        p.next_target();
+        p.begin(5);
+        assert_eq!(p.pending(), Some(5));
+        assert_eq!(p.reset(), 0);
+        assert_eq!(p.pending(), None);
+        assert!(p.current().is_empty());
+        assert_eq!(p.prev_target(), None);
+    }
+
+    #[test]
+    fn resize_forgets_boundaries_cut_for_the_old_height() {
+        let mut p = Pages::new(5);
+        p.accept(page(0, 5));
+        p.next_target();
+        p.accept(page(5, 5));
+        p.next_target(); // boundary at 10, cut for the old height
+        assert_eq!(p.resize(3), 5); // re-serve the current page…
+        p.accept(page(5, 3));
+        assert_eq!(p.prev_target(), Some(0)); // …the way back survives
+        assert_eq!(p.next_target(), Some(8)); // …the way forward is recut
+    }
+
+    #[test]
+    fn selection_scrolls_the_window_along() {
+        let mut p = Pages::new(2);
+        p.accept(page(0, 4)); // page taller than the window
+        assert!(!p.select_prev());
+        assert!(p.select_next());
+        assert_eq!((p.selected(), p.scroll()), (1, 0));
+        assert!(p.select_next());
+        assert_eq!((p.selected(), p.scroll()), (2, 1)); // window followed down
+        assert!(p.select_next());
+        assert!(!p.select_next()); // bottom row
+        assert_eq!((p.selected(), p.scroll()), (3, 2));
+        while p.select_prev() {}
+        assert_eq!((p.selected(), p.scroll()), (0, 0)); // and back up
+    }
+
+    #[test]
+    fn accept_shows_the_new_page_from_the_top() {
+        let mut p = Pages::new(2);
+        p.accept(page(0, 4));
+        p.select_next();
+        p.select_next();
+        p.accept(page(4, 4));
+        assert_eq!((p.selected(), p.scroll()), (0, 0));
+    }
+}

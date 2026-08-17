@@ -610,3 +610,17 @@ impl App {
         Ok(false)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::expand_tilde;
+
+    #[test]
+    fn expand_tilde_covers_home_and_leaves_the_rest() {
+        let home = std::env::var("HOME").expect("test needs HOME");
+        assert_eq!(expand_tilde("~"), home);
+        assert_eq!(expand_tilde("~/x/y"), format!("{home}/x/y"));
+        assert_eq!(expand_tilde("/abs/path"), "/abs/path");
+        assert_eq!(expand_tilde("~user/x"), "~user/x"); // only the own-home forms
+    }
+}

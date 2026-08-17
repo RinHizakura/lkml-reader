@@ -573,3 +573,134 @@ impl MailSource {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lkml_core::mail::PatchTag;
+
+    /// Patch `number/total` (v1) of the series rooted at `<root>`; `number` 0
+    /// is the cover letter, so it is its own root.
+    fn patch(root: &str, number: u32, total: u32) -> Mail {
+        Mail {
+            subject: format!("[{root} {number}/{total}]"),
+            message_id: if number == 0 {
+                format!("<{root}>")
+            } else {
+                format!("<{root}.{number}>")
+            },
+            references: if number == 0 {
+                Vec::new()
+            } else {
+                vec![format!("<{root}>")]
+            },
+            patch_tag: Some(PatchTag {
+                version: 1,
+                number,
+                total,
+            }),
+            ..Mail::default()
+        }
+    }
+
+    fn plain(subject: &str) -> Mail {
+        Mail {
+            subject: subject.to_string(),
+            ..Mail::default()
+        }
+    }
+
+    fn subjects(mails: &[Mail]) -> Vec<&str> {
+        mails.iter().map(|m| m.subject.as_str()).collect()
+    }
+
+    #[test]
+    fn series_forms_a_block_where_its_newest_mail_sat() {
+        let mails = vec![
+            patch("a", 2, 3),
+            plain("x"),
+            patch("a", 1, 3),
+            patch("a", 3, 3),
+        ];
+        let (out, indent) = group_series(&mails);
+        assert_eq!(subjects(&out), ["[a 1/3]", "[a 2/3]", "[a 3/3]", "x"]);
+        assert_eq!(indent, [false, true, true, false]);
+    }
+
+    #[test]
+    fn cover_letter_heads_its_block() {
+        let mails = vec![patch("a", 1, 2), patch("a", 0, 2), patch("a", 2, 2)];
+        let (out, indent) = group_series(&mails);
+        assert_eq!(subjects(&out), ["[a 0/2]", "[a 1/2]", "[a 2/2]"]);
+        assert_eq!(indent, [false, true, true]);
+    }
+
+    #[test]
+    fn two_series_group_independently() {
+        let mails = vec![
+            patch("a", 2, 2),
+            patch("b", 2, 2),
+            patch("b", 1, 2),
+            patch("a", 1, 2),
+        ];
+        let (out, _) = group_series(&mails);
+        assert_eq!(subjects(&out), ["[a 1/2]", "[a 2/2]", "[b 1/2]", "[b 2/2]"]);
+    }
+
+    #[test]
+    fn stray_member_and_lone_patch_stay_put() {
+        // Only 2/9 of its series is here, and a lone [PATCH 1/1] is no series:
+        // nothing to pull together, nothing indented.
+        let mails = vec![plain("x"), patch("s", 2, 9), patch("l", 1, 1)];
+        let (out, indent) = group_series(&mails);
+        assert_eq!(subjects(&out), ["x", "[s 2/9]", "[l 1/1]"]);
+        assert_eq!(indent, [false, false, false]);
+    }
+
+    #[test]
+    fn is_whole_ignores_missing_cover_and_other_series() {
+        let mails = vec![patch("a", 1, 2), patch("b", 2, 2), patch("a", 2, 2)];
+        let tag_a = thread::series_tag(&mails[0]).unwrap();
+        assert!(is_whole(&mails, &tag_a)); // 1..=2 present; no cover needed
+        let tag_b = thread::series_tag(&mails[1]).unwrap();
+        assert!(!is_whole(&mails, &tag_b)); // b is missing 1/2
+    }
+
+    #[test]
+    fn short_page_is_never_done() {
+        let mut chasing = None;
+        assert!(!page_done(&[plain("x")], 2, &mut chasing));
+        assert!(chasing.is_none());
+    }
+
+    #[test]
+    fn only_the_boundary_mail_starts_a_chase() {
+        // A half-present series further up the page does not: its siblings
+        // live somewhere else entirely.
+        let mails = [patch("a", 1, 2), plain("x")];
+        let mut chasing = None;
+        assert!(page_done(&mails, 2, &mut chasing));
+        assert!(chasing.is_none());
+    }
+
+    #[test]
+    fn page_cutting_a_series_chases_until_it_is_whole() {
+        let mut mails = vec![plain("x"), patch("a", 1, 3)];
+        let mut chasing = None;
+        assert!(!page_done(&mails, 2, &mut chasing));
+        assert!(chasing.is_some());
+        mails.push(patch("a", 2, 3));
+        assert!(!page_done(&mails, 2, &mut chasing));
+        mails.push(patch("a", 3, 3));
+        assert!(page_done(&mails, 2, &mut chasing));
+    }
+
+    #[test]
+    fn chase_gives_up_at_the_extend_cap() {
+        let mut mails = vec![patch("a", 1, 99)];
+        let mut chasing = None;
+        assert!(!page_done(&mails, 1, &mut chasing));
+        mails.resize_with(1 + SERIES_EXTEND_MAX, || plain("x"));
+        assert!(page_done(&mails, 1, &mut chasing));
+    }
+}

@@ -460,4 +460,25 @@ mod tests {
         let c = colors("@@ -1 +1 @@\n-x\nThen a note:\n- bullet again");
         assert_eq!(c, vec![Some(Color::Cyan), Some(Color::Red), None, None]);
     }
+
+    #[test]
+    fn pad_or_truncate_counts_chars_not_bytes() {
+        // Multi-byte subjects: `{:<w$}` on the raw str would count bytes and
+        // misalign every column to the right of it.
+        assert_eq!(pad_or_truncate("日本語", 5), "日本語  ");
+        assert_eq!(pad_or_truncate("日本語", 2), "日本");
+        assert_eq!(pad_or_truncate("ab", 4), "ab  ");
+    }
+
+    #[test]
+    fn subject_column_width_matches_the_row_layout() {
+        // 80 cols: prefix " [nnn] <date>  " = 25, author 24 + 1 space → 30 left.
+        assert_eq!(subject_column_width(80, 0, 10, false), 30);
+        // An indented row loses the "  ↳ " marker's 4 chars.
+        assert_eq!(subject_column_width(80, 0, 10, true), 26);
+        // A five-digit index widens the prefix by 2.
+        assert_eq!(subject_column_width(80, 99_000, 999, false), 28);
+        // Too narrow saturates instead of wrapping.
+        assert_eq!(subject_column_width(10, 0, 10, false), 0);
+    }
 }
