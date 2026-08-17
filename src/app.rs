@@ -66,12 +66,6 @@ pub struct App {
     /// The tree `git am` applies to, remembered across applies so the prompt
     /// only has to be answered once per session. Starts at the cwd.
     repo_path: String,
-
-    /// Marquee scroll position for the currently selected row's title. Advances
-    /// once per tick while sitting on a long-title row so the user can read
-    /// past the column's right edge.
-    selected_title_scroll: usize,
-    scroll_last_tick: Instant,
 }
 
 /// Rows a page fills — whatever the ui's content area can show. Floored at 1
@@ -114,14 +108,7 @@ impl App {
             repo_path: std::env::current_dir()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
-            selected_title_scroll: 0,
-            scroll_last_tick: Instant::now(),
         }
-    }
-
-    fn reset_title_scroll(&mut self) {
-        self.selected_title_scroll = 0;
-        self.scroll_last_tick = Instant::now();
     }
 
     /// Advance the marquee on the selected row when its title overflows the
@@ -134,26 +121,14 @@ impl App {
             return false;
         };
         let page = self.pages.current();
-        if !ui::title_overflows(
+        let overflows = ui::title_overflows(
             Tui::size().0,
             mail,
             page.offset,
             page.mails.len(),
             page.indented(self.pages.selected()),
-        ) {
-            if self.selected_title_scroll != 0 {
-                self.selected_title_scroll = 0;
-                return true;
-            }
-            return false;
-        }
-        let now = Instant::now();
-        if now.duration_since(self.scroll_last_tick) < Duration::from_millis(250) {
-            return false;
-        }
-        self.scroll_last_tick = now;
-        self.selected_title_scroll = self.selected_title_scroll.wrapping_add(1);
-        true
+        );
+        self.pages.tick_marquee(overflows, Instant::now())
     }
 
     fn bootstrap_manifest(&mut self, tui: &mut Tui) -> Result<()> {
@@ -335,7 +310,6 @@ impl App {
         match state? {
             PageState::Ready(page) => {
                 self.pages.accept(page);
-                self.reset_title_scroll();
             }
             PageState::Pending(message) => {
                 self.pages.begin(target);
@@ -424,7 +398,11 @@ impl App {
         let out = tui.out();
         match &self.view {
             View::Loading(msg) => ui::draw_loading(out, size, &header, msg),
-            View::List => ui::draw_list(out, size, &self.list_view(header, &self.empty_message())),
+            View::List => ui::draw_list(
+                out,
+                size,
+                &self.pages.list_view(header, &self.empty_message()),
+            ),
             View::Detail => {
                 ui::draw_detail(out, size, &header, &self.detail_text, self.detail_scroll)
             }
@@ -449,7 +427,7 @@ impl App {
         let (epoch_label, page_label) = (self.epoch_label(), self.pages.label());
         let filters = self.filters.labels();
         let header = self.header_info(&epoch_label, &page_label, &filters);
-        ui::redraw_selected_row(tui.out(), Tui::size(), &self.list_view(header, &[]))
+        ui::redraw_selected_row(tui.out(), Tui::size(), &self.pages.list_view(header, &[]))
     }
 
     /// What to say instead of rows when the page has none.
@@ -466,23 +444,6 @@ impl App {
             vec!["No mails on this page.".to_string()]
         } else {
             vec!["No mails match filter. Press '/', 'a' or 'd' to change it.".to_string()]
-        }
-    }
-
-    fn list_view<'a>(
-        &'a self,
-        header: ui::HeaderInfo<'a>,
-        empty_message: &'a [String],
-    ) -> ui::ListView<'a> {
-        ui::ListView {
-            header,
-            offset: self.pages.current().offset,
-            mails: &self.pages.current().mails,
-            indent: self.pages.current().indent(),
-            selected: self.pages.selected(),
-            scroll: self.pages.scroll(),
-            selected_scroll: self.selected_title_scroll,
-            empty_message,
         }
     }
 
@@ -576,14 +537,10 @@ impl App {
             View::List => match key.code {
                 KeyCode::Char('q') => return Ok(true),
                 KeyCode::Down => {
-                    if self.pages.select_next() {
-                        self.reset_title_scroll();
-                    }
+                    self.pages.select_next();
                 }
                 KeyCode::Up => {
-                    if self.pages.select_prev() {
-                        self.reset_title_scroll();
-                    }
+                    self.pages.select_prev();
                 }
                 KeyCode::Right => {
                     let _ = self.next_page(tui);

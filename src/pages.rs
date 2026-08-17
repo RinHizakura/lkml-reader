@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0
 
 //! Pagination state: which page of the stream is showing, where every visited
-//! page starts, which row is selected and how far the window has scrolled.
-//! Stream offsets never leave this module — callers navigate with
-//! `next_target`/`prev_target`/`reset` and read the current page — so the
-//! boundary bookkeeping, the reset rules and the scroll-follow math live (and
-//! are tested) in one place.
+//! page starts, which row is selected, how far the window has scrolled and
+//! where the selected title's marquee stands. Stream offsets never leave this
+//! module — callers navigate with `next_target`/`prev_target`/`reset` and
+//! read the current page — so the boundary bookkeeping, the reset rules and
+//! the scroll-follow math live (and are tested) in one place.
 
 use crate::source::Page;
+use crate::ui::{HeaderInfo, ListView};
 use lkml_core::mail::Mail;
+use std::time::{Duration, Instant};
 
 pub struct Pages {
     /// Rows a page aims to fill. A page can outgrow it (a long series is never
@@ -26,6 +28,10 @@ pub struct Pages {
     /// First row of the current page shown on screen. Non-zero only when the
     /// page is taller than the window.
     scroll: usize,
+    /// Marquee position for the selected row's overlong title. Restarts
+    /// whenever the selection lands somewhere new.
+    marquee: usize,
+    marquee_tick: Instant,
 }
 
 impl Pages {
@@ -37,6 +43,8 @@ impl Pages {
             pending: None,
             selected: 0,
             scroll: 0,
+            marquee: 0,
+            marquee_tick: Instant::now(),
         }
     }
 
@@ -48,6 +56,8 @@ impl Pages {
         self.selected
     }
 
+    /// Test observer: the app reads the scroll through `list_view`.
+    #[cfg(test)]
     pub fn scroll(&self) -> usize {
         self.scroll
     }
@@ -109,6 +119,7 @@ impl Pages {
         }
         self.current = page;
         self.pending = None;
+        self.reset_marquee();
     }
 
     /// Serving was given up on (the stream ended); nothing is pending anymore.
@@ -154,6 +165,7 @@ impl Pages {
         if self.selected >= self.scroll + self.page_size {
             self.scroll = self.selected + 1 - self.page_size;
         }
+        self.reset_marquee();
         true
     }
 
@@ -165,7 +177,59 @@ impl Pages {
         }
         self.selected -= 1;
         self.scroll = self.scroll.min(self.selected);
+        self.reset_marquee();
         true
+    }
+
+    /// Restart the marquee: a fresh selection reads from its title's start,
+    /// after the usual one-tick pause.
+    fn reset_marquee(&mut self) {
+        self.marquee = 0;
+        self.marquee_tick = Instant::now();
+    }
+
+    /// Test observer: the app reads the marquee through `list_view`.
+    #[cfg(test)]
+    pub fn marquee(&self) -> usize {
+        self.marquee
+    }
+
+    /// Advance the marquee by the caller's clock. `overflows` is whether the
+    /// selected title runs past its column — only the ui can answer that, so
+    /// the caller does. Returns whether a redraw is needed.
+    pub fn tick_marquee(&mut self, overflows: bool, now: Instant) -> bool {
+        if !overflows {
+            if self.marquee != 0 {
+                self.marquee = 0;
+                return true;
+            }
+            return false;
+        }
+        if now.duration_since(self.marquee_tick) < Duration::from_millis(250) {
+            return false;
+        }
+        self.marquee_tick = now;
+        self.marquee = self.marquee.wrapping_add(1);
+        true
+    }
+
+    /// The current page as the ui's list view, dressed with what only the app
+    /// knows: the header and the empty-page message.
+    pub fn list_view<'a>(
+        &'a self,
+        header: HeaderInfo<'a>,
+        empty_message: &'a [String],
+    ) -> ListView<'a> {
+        ListView {
+            header,
+            offset: self.current.offset,
+            mails: &self.current.mails,
+            indent: self.current.indent(),
+            selected: self.selected,
+            scroll: self.scroll,
+            selected_scroll: self.marquee,
+            empty_message,
+        }
     }
 }
 
@@ -271,6 +335,19 @@ mod tests {
         assert_eq!((p.selected(), p.scroll()), (3, 2));
         while p.select_prev() {}
         assert_eq!((p.selected(), p.scroll()), (0, 0)); // and back up
+    }
+
+    #[test]
+    fn marquee_advances_on_overflow_and_restarts_on_movement() {
+        let mut p = Pages::new(5);
+        p.accept(page(0, 2));
+        let later = Instant::now() + Duration::from_millis(300);
+        assert!(p.tick_marquee(true, later));
+        assert_eq!(p.marquee(), 1);
+        assert!(!p.tick_marquee(true, later)); // same instant: too soon again
+        p.select_next();
+        assert_eq!(p.marquee(), 0); // a fresh selection reads from the start
+        assert!(!p.tick_marquee(false, later)); // fits: nothing to redraw
     }
 
     #[test]
