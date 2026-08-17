@@ -6,7 +6,18 @@ on:
   pull_request:
 
 jobs:
-  ci:
+  # Needs no submodule, no cache, no compile — a rustfmt run on the sources.
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      # The same check the pre-commit hook runs locally.
+      - run: cargo fmt --all -- --check
+
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -16,9 +27,6 @@ jobs:
           submodules: true
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # The same check the pre-commit hook runs locally.
-      - name: Format
-        run: cargo fmt --all -- --check
       - name: Build
         run: cargo build
       - name: Unit tests
