@@ -12,7 +12,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread as stdthread;
 
-use lkml_core::archive;
+use lkml_core::archive::{self, Mirror};
 use lkml_core::filter::{DateFilter, Filter, NameFilter};
 use lkml_core::mail::{self, Mail};
 use lkml_core::thread::{self, SeriesTag};
@@ -285,17 +285,15 @@ impl FilterSet {
 /// Pages are materialized lazily by walking epochs only as far as needed, with
 /// per-epoch commit hashes cached on first visit.
 pub struct StreamSource {
-    list_name: String,
-    available_epochs: Vec<u32>,
+    mirror: Mirror,
     /// Lazy cache of commit hashes per epoch, populated on first visit.
     epoch_commits: HashMap<u32, Vec<String>>,
 }
 
 impl StreamSource {
-    pub fn new(list_name: String, available_epochs: Vec<u32>) -> Self {
+    pub fn new(mirror: Mirror) -> Self {
         Self {
-            list_name,
-            available_epochs,
+            mirror,
             epoch_commits: HashMap::new(),
         }
     }
@@ -306,7 +304,8 @@ impl StreamSource {
     /// first epoch that must be cloned to make progress, or `Exhausted` past
     /// the end of the stream.
     fn status(&mut self, offset: usize, page_size: usize) -> SourceStatus {
-        if self.available_epochs.is_empty() {
+        let epochs = self.mirror.epochs();
+        if epochs.is_empty() {
             return SourceStatus::Exhausted;
         }
 
@@ -314,10 +313,10 @@ impl StreamSource {
         let mut to_skip = offset;
         // The series the page ended in the middle of, once it is otherwise full.
         let mut chasing: Option<SeriesTag> = None;
-        let mut eidx = self.available_epochs.len();
+        let mut eidx = epochs.len();
         'epochs: while eidx > 0 {
             eidx -= 1;
-            let epoch = self.available_epochs[eidx];
+            let epoch = epochs[eidx];
             if !self.epoch_commits.contains_key(&epoch) {
                 // Cloning is only worth asking about while the page proper is
                 // still short; an extension chasing the tail of a series just
@@ -325,10 +324,10 @@ impl StreamSource {
                 if mails.len() >= page_size {
                     break;
                 }
-                if !archive::repo_exists(&self.list_name, epoch) {
+                if !self.mirror.is_cloned(epoch) {
                     return SourceStatus::NeedsClone(epoch);
                 }
-                match archive::list_all_commits(&self.list_name, epoch) {
+                match archive::list_all_commits(self.mirror.list(), epoch) {
                     Ok(commits) => {
                         self.epoch_commits.insert(epoch, commits);
                     }
@@ -362,7 +361,7 @@ impl StreamSource {
                 // Still append one at a time: the page ends the moment the series
                 // it was cutting completes, and only a per-mail check finds that
                 // boundary. Whatever of the batch is past it goes unused.
-                for mail in mail::fetch(&self.list_name, epoch, batch)
+                for mail in mail::fetch(self.mirror.list(), epoch, batch)
                     .unwrap_or_default()
                     .into_iter()
                 {
@@ -385,7 +384,7 @@ impl StreamSource {
 /// `rx`; the owner drains them into `results` via `poll` and serves pages from
 /// there. Dropping the source cancels its worker.
 pub struct FilteredSource {
-    list_name: String,
+    mirror: Mirror,
     filters: FilterSet,
     rx: Receiver<Mail>,
     cancel: Arc<AtomicBool>,
@@ -397,24 +396,20 @@ pub struct FilteredSource {
 }
 
 impl FilteredSource {
-    /// Start a background scan over `available_epochs` for mails matching
+    /// Start a background scan over every epoch of `mirror` for mails matching
     /// `filters`. At least one filter should be active; an entirely inert set
     /// is allowed but pointless (caller should use the unfiltered stream
     /// instead). Epochs present locally are scanned right away; the rest are
     /// queued for on-demand cloning.
-    pub fn start(list_name: String, filters: FilterSet, available_epochs: &[u32]) -> Self {
-        let mut scan: Vec<u32> = Vec::new();
-        let mut uncloned: Vec<u32> = Vec::new();
-        for &epoch in available_epochs.iter().rev() {
-            if archive::repo_exists(&list_name, epoch) {
-                scan.push(epoch);
-            } else {
-                uncloned.push(epoch);
-            }
-        }
-        let (rx, cancel) = spawn_worker(list_name.clone(), scan, filters.clone());
+    pub fn start(mirror: Mirror, filters: FilterSet) -> Self {
+        let (scan, uncloned): (Vec<u32>, Vec<u32>) = mirror
+            .epochs()
+            .iter()
+            .rev()
+            .partition(|&&epoch| mirror.is_cloned(epoch));
+        let (rx, cancel) = spawn_worker(mirror.clone(), scan, filters.clone());
         Self {
-            list_name,
+            mirror,
             filters,
             rx,
             cancel,
@@ -475,7 +470,7 @@ impl FilteredSource {
     /// to the existing results.
     fn extend(&mut self, epoch: u32) {
         self.discard_uncloned(epoch);
-        let (rx, cancel) = spawn_worker(self.list_name.clone(), vec![epoch], self.filters.clone());
+        let (rx, cancel) = spawn_worker(self.mirror.clone(), vec![epoch], self.filters.clone());
         self.rx = rx;
         self.cancel = cancel;
         self.done = false;
@@ -494,7 +489,7 @@ impl Drop for FilteredSource {
 /// are read and parsed, and the rest of the predicate runs on those. Stops
 /// promptly when `cancel` is set or the receiver is dropped.
 fn spawn_worker(
-    list: String,
+    mirror: Mirror,
     epochs: Vec<u32>,
     filters: FilterSet,
 ) -> (Receiver<Mail>, Arc<AtomicBool>) {
@@ -506,17 +501,17 @@ fn spawn_worker(
             if cancel_worker.load(Ordering::Relaxed) {
                 return;
             }
-            if !archive::repo_exists(&list, epoch) {
+            if !mirror.is_cloned(epoch) {
                 continue;
             }
             let (subject, author) = filters.search_args();
-            let Ok(commits) = archive::search_commits(&list, epoch, subject, author) else {
+            let Ok(commits) = archive::search_commits(mirror.list(), epoch, subject, author) else {
                 continue;
             };
             // mail::read batches the git work and streams mails as they parse,
             // so results show up as they are found and a cancel lands within
             // one batch.
-            for mail in mail::read(&list, epoch, &commits) {
+            for mail in mail::read(mirror.list(), epoch, &commits) {
                 if cancel_worker.load(Ordering::Relaxed) {
                     return;
                 }
@@ -565,7 +560,7 @@ impl MailSource {
                 SourceStatus::Exhausted => return Ok(PageState::End),
                 SourceStatus::NeedsClone(epoch) => {
                     if consent(epoch)? {
-                        if archive::ensure_epoch(self.list_name(), epoch).is_err() {
+                        if self.mirror().ensure(epoch).is_err() {
                             return Ok(PageState::End);
                         }
                         self.on_cloned(epoch);
@@ -577,10 +572,10 @@ impl MailSource {
         }
     }
 
-    fn list_name(&self) -> &str {
+    fn mirror(&self) -> &Mirror {
         match self {
-            MailSource::Stream(s) => &s.list_name,
-            MailSource::Filtered(f) => &f.list_name,
+            MailSource::Stream(s) => &s.mirror,
+            MailSource::Filtered(f) => &f.mirror,
         }
     }
 

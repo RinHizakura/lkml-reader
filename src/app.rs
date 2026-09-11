@@ -4,7 +4,7 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::time::{Duration, Instant};
 
-use lkml_core::archive;
+use lkml_core::archive::Mirror;
 use lkml_core::mail::Mail;
 use lkml_core::thread;
 
@@ -35,10 +35,9 @@ pub struct App {
     list_name: String,
     filters: FilterSet,
 
-    available_epochs: Vec<u32>,
-    /// The newest epoch: the one bootstrapped and refreshed by `u`. Paging walks
-    /// every epoch, so this only names the mirror the reader keeps current.
-    cur_epoch: u32,
+    /// Which epochs the list has and which are cloned. Starts as whatever the
+    /// cache already holds; the manifest replaces it once fetched.
+    mirror: Mirror,
     /// Whether the current epoch's mirror has been prepared; gates the
     /// "no local mirror" empty-state message. The archive module owns the
     /// actual paths, so the app only tracks readiness, not where it lives.
@@ -91,12 +90,12 @@ fn expand_tilde(path: &str) -> String {
 
 impl App {
     pub fn new(list_name: String) -> Self {
-        let source = MailSource::Stream(StreamSource::new(list_name.clone(), Vec::new()));
+        let mirror = Mirror::local(&list_name);
+        let source = MailSource::Stream(StreamSource::new(mirror.clone()));
         Self {
             list_name,
             filters: FilterSet::new(),
-            available_epochs: Vec::new(),
-            cur_epoch: 0,
+            mirror,
             repo_ready: false,
             source,
             pages: Pages::new(page_size_for_terminal()),
@@ -137,32 +136,34 @@ impl App {
 
         // A network failure here is non-fatal: fall through to whatever mirror
         // is already cached locally.
-        if let Ok(epochs) = archive::list_epochs(&self.list_name) {
-            self.cur_epoch = epochs.last().copied().unwrap_or_default();
-            self.available_epochs = epochs;
+        if let Ok(mirror) = Mirror::open(&self.list_name) {
+            self.mirror = mirror;
         }
         Ok(())
     }
 
+    /// The newest epoch: the one bootstrapped and refreshed by `u`. Paging walks
+    /// every epoch, so this only names the mirror the reader keeps current.
+    fn cur_epoch(&self) -> u32 {
+        self.mirror.newest().unwrap_or_default()
+    }
+
     fn bootstrap_mirror(&mut self, tui: &mut Tui) -> Result<()> {
-        let exists = archive::repo_exists(&self.list_name, self.cur_epoch);
-        let loading_message = if exists {
-            format!(
-                "Updating mirror {} epoch {}…",
-                self.list_name, self.cur_epoch
-            )
+        let epoch = self.cur_epoch();
+        let loading_message = if self.mirror.is_cloned(epoch) {
+            format!("Updating mirror {} epoch {}…", self.list_name, epoch)
         } else {
             format!(
                 "Cloning mirror {} epoch {} (this may take a while)…",
-                self.list_name, self.cur_epoch
+                self.list_name, epoch
             )
         };
         self.view = View::Loading(loading_message);
         self.render(tui)?;
 
-        // The archive module decides clone-vs-update; `exists` above only picks
-        // the right loading message.
-        archive::ensure_epoch(&self.list_name, self.cur_epoch)?;
+        // The mirror decides clone-vs-update; `is_cloned` above only picks the
+        // right loading message.
+        self.mirror.ensure(epoch)?;
         Ok(())
     }
 
@@ -176,10 +177,7 @@ impl App {
 
     /// The unfiltered stream over every epoch we know of.
     fn stream(&self) -> MailSource {
-        MailSource::Stream(StreamSource::new(
-            self.list_name.clone(),
-            self.available_epochs.clone(),
-        ))
+        MailSource::Stream(StreamSource::new(self.mirror.clone()))
     }
 
     /// Reload from scratch: drop to a fresh unfiltered stream, reset to page 0.
@@ -262,9 +260,8 @@ impl App {
             return self.read_from(self.stream(), tui);
         }
         let scan = MailSource::Filtered(FilteredSource::start(
-            self.list_name.clone(),
+            self.mirror.clone(),
             self.filters.clone(),
-            &self.available_epochs,
         ));
         // The scan has nothing yet, so this leaves the source's own loading
         // screen up; the run loop serves the page once matches arrive.
@@ -465,9 +462,9 @@ impl App {
     }
 
     fn epoch_label(&self) -> String {
-        match self.available_epochs.len() {
+        match self.mirror.epochs().len() {
             0 => "-".to_string(),
-            n => format!("{} (newest of {n})", self.cur_epoch),
+            n => format!("{} (newest of {n})", self.cur_epoch()),
         }
     }
 
@@ -557,12 +554,13 @@ impl App {
                 KeyCode::Char('a') => self.open_prompt(Prompt::Filter(Constraint::Author)),
                 KeyCode::Char('d') => self.open_prompt(Prompt::Filter(Constraint::Date)),
                 KeyCode::Char('u') => {
+                    let epoch = self.cur_epoch();
                     self.view = View::Loading(format!(
                         "Updating mirror {} epoch {}…",
-                        self.list_name, self.cur_epoch
+                        self.list_name, epoch
                     ));
                     self.render(tui)?;
-                    if archive::ensure_epoch(&self.list_name, self.cur_epoch).is_ok() {
+                    if self.mirror.ensure(epoch).is_ok() {
                         self.view = View::Loading("Reloading mails…".to_string());
                         self.render(tui)?;
                         if !self.filters.is_active() {
