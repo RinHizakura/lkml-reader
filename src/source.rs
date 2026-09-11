@@ -488,9 +488,6 @@ impl Drop for FilteredSource {
     }
 }
 
-/// How many matching mails one git process reads for the filter scan.
-const FILTER_CHUNK: usize = 64;
-
 /// Spawn a worker that scans `epochs` (newest-first) and sends every mail that
 /// satisfies all filters. Subject and author are pushed down into `git log`,
 /// which narrows a whole epoch in about a second; only the surviving commits
@@ -516,21 +513,15 @@ fn spawn_worker(
             let Ok(commits) = archive::search_commits(&list, epoch, subject, author) else {
                 continue;
             };
-            // In chunks, so one git process serves many matches — a broad filter
-            // matches thousands, and a process each is most of the wait. Small
-            // enough that results still stream in as they are found, and that
-            // cancelling lands within a chunk.
-            for chunk in commits.chunks(FILTER_CHUNK) {
+            // mail::read batches the git work and streams mails as they parse,
+            // so results show up as they are found and a cancel lands within
+            // one batch.
+            for mail in mail::read(&list, epoch, &commits) {
                 if cancel_worker.load(Ordering::Relaxed) {
                     return;
                 }
-                let Ok(mails) = mail::fetch(&list, epoch, chunk) else {
-                    continue;
-                };
-                for mail in mails {
-                    if filters.matches(&mail) && tx.send(mail).is_err() {
-                        return;
-                    }
+                if filters.matches(&mail) && tx.send(mail).is_err() {
+                    return;
                 }
             }
         }
