@@ -6,7 +6,7 @@
 //! parsing and archive I/O.
 
 use anyhow::{anyhow, Result};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
@@ -73,7 +73,7 @@ impl Page {
     /// A page of the unfiltered stream: patch series pulled into blocks and
     /// marked for indentation.
     pub fn grouped(mails: Vec<Mail>, offset: usize) -> Self {
-        let (mails, indent) = group_series(&mails);
+        let (mails, indent) = thread::group_series(&mails);
         Self {
             mails,
             indent,
@@ -112,43 +112,6 @@ impl Page {
     }
 }
 
-/// Reorder `mails` so every patch series forms one block — cover letter (or
-/// lowest-numbered patch) first, the rest ascending — sitting where the series'
-/// newest mail was, and flag the members that belong under the head.
-fn group_series(mails: &[Mail]) -> (Vec<Mail>, Vec<bool>) {
-    let tags: Vec<Option<SeriesTag>> = mails.iter().map(thread::series_tag).collect();
-    let mut series: HashMap<&SeriesTag, Vec<usize>> = HashMap::new();
-    for (i, tag) in tags.iter().enumerate() {
-        if let Some(tag) = tag {
-            series.entry(tag).or_default().push(i);
-        }
-    }
-    for members in series.values_mut() {
-        members.sort_by_key(|&i| mails[i].patch_tag.map_or(0, |t| t.number));
-    }
-
-    let mut out = Vec::with_capacity(mails.len());
-    let mut indent = Vec::with_capacity(mails.len());
-    let mut placed = vec![false; mails.len()];
-    for i in 0..mails.len() {
-        if placed[i] {
-            continue;
-        }
-        // The whole series lands here, where its newest mail sat. A lone member
-        // stays put: there is nothing to indent it under.
-        let block = match tags[i].as_ref().and_then(|tag| series.get(tag)) {
-            Some(members) if members.len() > 1 => members.as_slice(),
-            _ => std::slice::from_ref(&i),
-        };
-        for (nth, &j) in block.iter().enumerate() {
-            placed[j] = true;
-            out.push(mails[j].clone());
-            indent.push(nth > 0);
-        }
-    }
-    (out, indent)
-}
-
 /// Has the walk collected everything the page needs? Short of `page_size`, never.
 /// At that point the page either ends cleanly and is done, or ends mid-series and
 /// `chasing` takes up the rest of that series — bounded by [`SERIES_EXTEND_MAX`],
@@ -158,28 +121,17 @@ fn page_done(mails: &[Mail], page_size: usize, chasing: &mut Option<SeriesTag>) 
         return false;
     }
     match chasing {
-        Some(tag) => is_whole(mails, tag) || mails.len() >= page_size + SERIES_EXTEND_MAX,
+        Some(tag) => thread::is_whole(mails, tag) || mails.len() >= page_size + SERIES_EXTEND_MAX,
         // Only the mail at the boundary counts. A series that looks half-present
         // further up the page is one whose siblings live somewhere else entirely
         // — an old patch resent, a stray `2/9` — and chasing every one of those
         // drags in mails that cut yet more series, page after page.
         None => {
             *chasing = thread::series_tag(mails.last().expect("page_size > 0"))
-                .filter(|tag| !is_whole(mails, tag));
+                .filter(|tag| !thread::is_whole(mails, tag));
             chasing.is_none()
         }
     }
-}
-
-/// Is every patch of `tag` on the page? The 0/m cover letter is optional;
-/// 1/m..m/m are not.
-fn is_whole(mails: &[Mail], tag: &SeriesTag) -> bool {
-    let seen: HashSet<u32> = mails
-        .iter()
-        .filter(|mail| thread::series_tag(mail).as_ref() == Some(tag))
-        .filter_map(|mail| mail.patch_tag.map(|patch| patch.number))
-        .collect();
-    (1..=tag.total).all(|n| seen.contains(&n))
 }
 
 /// One of the three filter constraints, for driving the shared prompt flow.
@@ -643,62 +595,6 @@ mod tests {
             subject: subject.to_string(),
             ..Mail::default()
         }
-    }
-
-    fn subjects(mails: &[Mail]) -> Vec<&str> {
-        mails.iter().map(|m| m.subject.as_str()).collect()
-    }
-
-    #[test]
-    fn series_forms_a_block_where_its_newest_mail_sat() {
-        let mails = vec![
-            patch("a", 2, 3),
-            plain("x"),
-            patch("a", 1, 3),
-            patch("a", 3, 3),
-        ];
-        let (out, indent) = group_series(&mails);
-        assert_eq!(subjects(&out), ["[a 1/3]", "[a 2/3]", "[a 3/3]", "x"]);
-        assert_eq!(indent, [false, true, true, false]);
-    }
-
-    #[test]
-    fn cover_letter_heads_its_block() {
-        let mails = vec![patch("a", 1, 2), patch("a", 0, 2), patch("a", 2, 2)];
-        let (out, indent) = group_series(&mails);
-        assert_eq!(subjects(&out), ["[a 0/2]", "[a 1/2]", "[a 2/2]"]);
-        assert_eq!(indent, [false, true, true]);
-    }
-
-    #[test]
-    fn two_series_group_independently() {
-        let mails = vec![
-            patch("a", 2, 2),
-            patch("b", 2, 2),
-            patch("b", 1, 2),
-            patch("a", 1, 2),
-        ];
-        let (out, _) = group_series(&mails);
-        assert_eq!(subjects(&out), ["[a 1/2]", "[a 2/2]", "[b 1/2]", "[b 2/2]"]);
-    }
-
-    #[test]
-    fn stray_member_and_lone_patch_stay_put() {
-        // Only 2/9 of its series is here, and a lone [PATCH 1/1] is no series:
-        // nothing to pull together, nothing indented.
-        let mails = vec![plain("x"), patch("s", 2, 9), patch("l", 1, 1)];
-        let (out, indent) = group_series(&mails);
-        assert_eq!(subjects(&out), ["x", "[s 2/9]", "[l 1/1]"]);
-        assert_eq!(indent, [false, false, false]);
-    }
-
-    #[test]
-    fn is_whole_ignores_missing_cover_and_other_series() {
-        let mails = vec![patch("a", 1, 2), patch("b", 2, 2), patch("a", 2, 2)];
-        let tag_a = thread::series_tag(&mails[0]).unwrap();
-        assert!(is_whole(&mails, &tag_a)); // 1..=2 present; no cover needed
-        let tag_b = thread::series_tag(&mails[1]).unwrap();
-        assert!(!is_whole(&mails, &tag_b)); // b is missing 1/2
     }
 
     #[test]
