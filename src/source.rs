@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::thread as stdthread;
 
 use lkml_core::archive::{self, Mirror};
-use lkml_core::filter::{DateFilter, Filter, NameFilter};
+use lkml_core::filter::DateRange;
 use lkml_core::mail::{self, Mail};
 use lkml_core::thread::{self, SeriesTag};
 
@@ -148,23 +148,36 @@ pub enum Constraint {
 /// come from here — the one home for every representation of "matches".
 #[derive(Clone)]
 pub struct FilterSet {
-    subject: NameFilter,
-    author: NameFilter,
-    date: DateFilter,
+    /// Case-insensitive substrings of the subject / decoded `From`; `None`
+    /// is no constraint.
+    subject: Option<String>,
+    author: Option<String>,
+    date: Option<DateRange>,
+}
+
+/// A constraint's value for a label or prompt: the value, or "(none)".
+fn show<T: std::fmt::Display>(value: &Option<T>) -> String {
+    value.as_ref().map_or("(none)".to_string(), T::to_string)
+}
+
+/// A needle from raw user text; empty text is no constraint.
+fn needle(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 impl FilterSet {
     pub fn new() -> Self {
         Self {
-            subject: NameFilter::subject(),
-            author: NameFilter::author(),
-            date: DateFilter::new(),
+            subject: None,
+            author: None,
+            date: None,
         }
     }
 
     /// Whether any constraint is set.
     pub fn is_active(&self) -> bool {
-        self.subject.is_active() || self.author.is_active() || self.date.is_active()
+        self.subject.is_some() || self.author.is_some() || self.date.is_some()
     }
 
     /// The prompt label for editing `which`, current value included.
@@ -172,15 +185,15 @@ impl FilterSet {
         match which {
             Constraint::Subject => format!(
                 "Filter (subject substring, empty=clear) [{}]: ",
-                self.subject
+                show(&self.subject)
             ),
             Constraint::Author => format!(
                 "Filter (author substring, empty=clear) [{}]: ",
-                self.author
+                show(&self.author)
             ),
             Constraint::Date => format!(
                 "Filter date (today | yesterday | YYYY/MM/DD HH:MM to YYYY/MM/DD HH:MM, empty=clear) [{}]: ",
-                self.date
+                show(&self.date)
             ),
         }
     }
@@ -189,45 +202,42 @@ impl FilterSet {
     /// fail: it is the only constraint with a syntax to get wrong.
     pub fn set(&mut self, which: Constraint, answer: &str) -> Result<()> {
         match which {
-            Constraint::Subject => self.subject.set(answer),
-            Constraint::Author => self.author.set(answer),
-            Constraint::Date => self
-                .date
-                .set(answer)
-                .map_err(|e| anyhow!("Invalid date filter: {e}"))?,
+            Constraint::Subject => self.subject = needle(answer),
+            Constraint::Author => self.author = needle(answer),
+            Constraint::Date => {
+                self.date = match needle(answer) {
+                    None => None,
+                    Some(text) => Some(
+                        DateRange::parse(&text).map_err(|e| anyhow!("Invalid date filter: {e}"))?,
+                    ),
+                }
+            }
         }
         Ok(())
     }
 
     /// The constraints as header-ready display strings: subject, author, date.
     pub fn labels(&self) -> [String; 3] {
-        [
-            self.subject.to_string(),
-            self.author.to_string(),
-            self.date.to_string(),
-        ]
+        [show(&self.subject), show(&self.author), show(&self.date)]
     }
 
     /// The needles `git log` narrows an epoch by: (subject, author).
     fn search_args(&self) -> (Option<&str>, Option<&str>) {
-        (
-            self.subject.needle.as_deref(),
-            self.author.needle.as_deref(),
-        )
+        (self.subject.as_deref(), self.author.as_deref())
     }
 
     /// The Rust-side predicate for what the git pushdown cannot narrow.
     fn matches(&self, mail: &Mail) -> bool {
-        self.date.matches(mail)
+        self.date.as_ref().is_none_or(|range| range.contains(mail))
     }
 
     /// The loading-screen line for a scan with `count` matches so far.
     fn progress(&self, count: usize) -> String {
         format!(
             "Filtering subject='{}' author='{}' date='{}'… ({count} match{} so far)",
-            self.subject,
-            self.author,
-            self.date,
+            show(&self.subject),
+            show(&self.author),
+            show(&self.date),
             if count == 1 { "" } else { "es" }
         )
     }
