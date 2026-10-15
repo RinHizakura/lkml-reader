@@ -11,7 +11,7 @@ community.
 
 ## Demo
 
-[![Terminal Demo](https://asciinema.org/a/hUVq34k2Dv1nIJdb.svg)](https://asciinema.org/a/hUVq34k2Dv1nIJdb)
+[![Terminal Demo](artifacts/demo.svg)](https://asciinema.org/a/hUVq34k2Dv1nIJdb)
 
 ## Features
 
