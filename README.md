@@ -11,7 +11,7 @@ community.
 
 ## Demo
 
-![Terminal Demo](artifacts/demo-2026-10.gif)
+[![Terminal Demo](https://asciinema.org/a/KU59MaDin7oUV616.svg)](https://asciinema.org/a/KU59MaDin7oUV616)
 
 ## Features
 
