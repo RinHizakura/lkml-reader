@@ -11,7 +11,7 @@ community.
 
 ## Demo
 
-![Terminal Demo](artifacts/demo.gif)
+![Terminal Demo](artifacts/demo-2026-10.gif)
 
 ## Features
 
